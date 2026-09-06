@@ -288,12 +288,62 @@ pub fn build(b: *std.Build) void {
             output_name,
         );
         pgso_ir_step.dependOn(&install_ir.step);
+        if (artifact == .omfx) {
+            const genome_archive = addGenomeArchive(b, target, .ReleaseSafe);
+            const install_genome = b.addInstallFile(
+                genome_archive.getEmittedBin(),
+                "pgso/genome.a",
+            );
+            pgso_ir_step.dependOn(&install_genome.step);
+        }
     } else {
         const missing_artifact = b.addFail(
             "pgso-ir requires -Dpgso-artifact",
         );
         pgso_ir_step.dependOn(&missing_artifact.step);
     }
+}
+
+fn addGenomeArchive(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+) *std.Build.Step.Compile {
+    const archive_module = b.createModule(.{ .target = target, .optimize = optimize, .link_libc = true });
+    const flags = [_][]const u8{ "-std=gnu11", "-fno-sanitize=undefined" };
+    const runtime_module = b.createModule(.{ .target = target, .optimize = optimize, .link_libc = true });
+    runtime_module.addIncludePath(b.path("vendor/tree-sitter/lib/include"));
+    runtime_module.addIncludePath(b.path("vendor/tree-sitter/lib/src"));
+    runtime_module.addCSourceFile(.{ .file = b.path("vendor/tree-sitter/lib/src/lib.c"), .flags = &flags });
+    archive_module.addObject(b.addObject(.{ .name = "genome-runtime", .root_module = runtime_module }));
+    const grammars = [_]struct { dir: []const u8, scanner: bool }{
+        .{ .dir = "typescript", .scanner = true },
+        .{ .dir = "tsx", .scanner = true },
+        .{ .dir = "python", .scanner = true },
+        .{ .dir = "go", .scanner = false },
+        .{ .dir = "rust", .scanner = true },
+        .{ .dir = "nix", .scanner = true },
+        .{ .dir = "zig", .scanner = false },
+    };
+    inline for (grammars) |grammar| {
+        const grammar_module = b.createModule(.{ .target = target, .optimize = optimize, .link_libc = true });
+        grammar_module.addIncludePath(b.path("vendor/grammars/" ++ grammar.dir ++ "/src"));
+        if (grammar.scanner) grammar_module.addIncludePath(b.path("vendor/grammars/" ++ grammar.dir));
+        grammar_module.addCSourceFile(.{
+            .file = b.path("vendor/grammars/" ++ grammar.dir ++ "/src/parser.c"),
+            .flags = &flags,
+        });
+        if (grammar.scanner) grammar_module.addCSourceFile(.{
+            .file = b.path("vendor/grammars/" ++ grammar.dir ++ "/src/scanner.c"),
+            .flags = &flags,
+        });
+        archive_module.addObject(b.addObject(.{ .name = "genome-" ++ grammar.dir, .root_module = grammar_module }));
+    }
+    return b.addLibrary(.{
+        .name = "genome",
+        .linkage = .static,
+        .root_module = archive_module,
+    });
 }
 
 fn addRushModule(

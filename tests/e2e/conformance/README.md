@@ -28,7 +28,7 @@ FX_SOUND=0 npm test
 
 `npm ci` must leave `package-lock.json` unchanged. Update the lock only when the
 pinned conformance package changes intentionally. The runner also fails before
-starting scenarios when the freshly built `zig-out/bin/fx` is missing.
+starting scenarios when the freshly built `zig-out/bin/omfx` is missing.
 
 `expected-failures.yml` lists individual check IDs rather than whole scenarios.
 The runner exits nonzero when a new check fails or a listed check starts
@@ -37,5 +37,5 @@ passing, so any conformance change requires an intentional baseline update.
 `client.ts` uses the runner's scenario/context variables to select the fake
 Gateway tool calls and requested protocol. It opts into the newer discovery
 lifecycle for the `2026-07-28` suite; the legacy scenarios use MCP v1. It then
-launches `./zig-out/bin/fx` without implementing MCP messages or transport
+launches `./zig-out/bin/omfx` without implementing MCP messages or transport
 behavior.

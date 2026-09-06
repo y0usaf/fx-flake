@@ -263,6 +263,13 @@ def _runtime_environment(paths: PipelinePaths) -> dict[str, str]:
     return environment
 
 
+def genome_link_args(paths: PipelinePaths) -> tuple[str, ...]:
+    """Link the separately emitted C archive only for the main executable."""
+    if paths.selector != "omfx":
+        return ()
+    return (str(paths.ir_prefix / "pgso" / "genome.a"),)
+
+
 def zig_build_argv(
     toolchain: Toolchain,
     spec: ArtifactSpec,
@@ -352,6 +359,7 @@ def instrumented_link_argv(
         str(paths.instrumented_object),
         str(toolchain.profile_runtime),
         str(compiler_runtime_object),
+        *genome_link_args(paths),
         "-o",
         str(paths.instrumented_binary),
         "-lc",
@@ -371,6 +379,7 @@ def candidate_link_argv(
         "-Wl,-dead_strip",
         "-s",
         str(paths.profile_use_object),
+        *genome_link_args(paths),
         "-o",
         str(paths.candidate_binary),
         "-lc",
@@ -425,6 +434,8 @@ def emit_bitcode(
         timeout_s=900,
         log_path=paths.logs / "emit-bitcode.json",
     )
+    for archive in genome_link_args(paths):
+        _require_nonempty_file(pathlib.Path(archive), "Tree-sitter C archive")
     _require_nonempty_file(paths.bitcode, "ReleaseSafe LLVM bitcode")
     with paths.bitcode.open("rb") as stream:
         if stream.read(4) != b"BC\xc0\xde":
@@ -494,6 +505,7 @@ def _discover_compiler_runtime(
             "-###",
             str(paths.instrumented_object),
             str(toolchain.profile_runtime),
+            *genome_link_args(paths),
             "-o",
             str(paths.instrumented / "runtime-probe"),
         ),
@@ -605,6 +617,8 @@ def build_instrumented(
     training_argv: Sequence[str] = ("help",),
     training_name: str = "help",
 ) -> tuple[pathlib.Path, ...]:
+    for archive in genome_link_args(paths):
+        _require_nonempty_file(pathlib.Path(archive), "Tree-sitter C archive")
     _require_nonempty_file(paths.bitcode, "ReleaseSafe LLVM bitcode")
     run_checked(
         instrumentation_argv(toolchain, paths),

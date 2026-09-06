@@ -66,7 +66,7 @@ It drives one tmux shell through this shape:
 
 1. Start a shell with temp `HOME`, `ZDOTDIR`, history, and workdir.
 2. Print shell markers and wrapped lines before Fx starts.
-3. Launch the freshly built `zig-out/bin/fx`.
+3. Launch the freshly built `zig-out/bin/omfx`.
 4. Run no-key slash commands such as `/status`.
 5. Quit Fx.
 6. Print more shell markers in the same shell.
@@ -384,7 +384,7 @@ zig fmt src/
 cd tests/e2e
 bun test tui-render-lab.test.ts
 bun run render-lab -- --scenario same-shell-relaunch --runs 1 --out /private/tmp/fx-render-lab
-../../zig-out/bin/fx status --json
+../../zig-out/bin/omfx status --json
 git diff --check
 ```
 

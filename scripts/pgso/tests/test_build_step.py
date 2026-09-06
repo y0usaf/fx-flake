@@ -32,6 +32,11 @@ class PgsoBuildStepTests(unittest.TestCase):
             self.assertEqual(0, result.returncode, result.stdout + result.stderr)
             bitcode = pathlib.Path(tmp) / "pgso" / output_name
             self.assertGreater(bitcode.stat().st_size, 0)
+            archive = pathlib.Path(tmp) / "pgso" / "genome.a"
+            if selector == "omfx":
+                self.assertGreater(archive.stat().st_size, 0)
+            else:
+                self.assertFalse(archive.exists())
             with bitcode.open("rb") as stream:
                 self.assertEqual(b"BC\xc0\xde", stream.read(4))
 

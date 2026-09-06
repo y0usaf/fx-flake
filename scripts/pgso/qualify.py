@@ -19,6 +19,7 @@ from scripts.pgso.pipeline import (
     collect_instrumented_profile,
     emit_bitcode,
     link_candidate,
+    genome_link_args,
     merge_profile_batch,
     read_macos_minos,
 )
@@ -529,6 +530,7 @@ def _external_control_link_argv(
         "-Wl,-dead_strip",
         "-s",
         str(object_path),
+        *genome_link_args(paths),
         "-o",
         str(binary_path),
         "-lc",

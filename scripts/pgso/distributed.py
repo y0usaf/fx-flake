@@ -533,6 +533,11 @@ def _load_seed(
     validate_seed_identity(identity)
     _validate_checkout(identity, corpus, log_dir)
     _require_hash(paths.bitcode, identity.bitcode_sha256, "seed bitcode")
+    _require_hash(
+        paths.ir_prefix / "pgso" / "genome.a",
+        evidence.get("genome_archive_sha256"),
+        "seed genome archive",
+    )
     control = _mapping(evidence.get("control"), "seed control evidence")
     _require_hash(paths.control_binary, control.get("sha256"), "seed control binary")
     instrumented = _mapping(
@@ -852,6 +857,11 @@ def run_candidate(arguments: argparse.Namespace) -> pathlib.Path:
         update_channel=identity.update_channel,
     )
     emit_bitcode(toolchain, spec, paths, expected_sha256=identity.bitcode_sha256)
+    _require_hash(
+        paths.ir_prefix / "pgso" / "genome.a",
+        seed_evidence.get("genome_archive_sha256"),
+        "candidate genome archive",
+    )
     apply_profile(toolchain, paths, identity.bitcode_sha256)
     link_candidate(toolchain, paths)
     linked_benchmarks = relink_profile_linked_benchmarks(

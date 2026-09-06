@@ -6,10 +6,14 @@ import pathlib
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
+from types import SimpleNamespace
 
 from scripts.pgso.model import PgsoError, sha256_file
 from scripts.pgso.pipeline import (
     BENCHMARK_USE_FLAGS,
+    _discover_compiler_runtime,
+    emit_bitcode,
     FX_MACHINE_OUTLINER_FLAGS,
     GENERATION_FLAGS,
     PROFILE_SECTION_ALIGNMENTS,
@@ -51,6 +55,22 @@ class PgsoPipelineTests(unittest.TestCase):
 
     def tearDown(self) -> None:
         self.temporary_directory.cleanup()
+
+    def test_runtime_probe_links_genome_archive(self) -> None:
+        runtime = self.root / "libcompiler_rt.a"
+        runtime.write_bytes(b"archive")
+        result = SimpleNamespace(stdout=f"zig ld {runtime}", stderr="")
+        with patch("scripts.pgso.pipeline.run_checked", return_value=result) as run:
+            self.assertEqual(runtime, _discover_compiler_runtime(self.toolchain, self.paths))
+        self.assertIn(str(self.paths.ir_prefix / "pgso/genome.a"), run.call_args.args[0])
+
+    def test_bitcode_emission_requires_main_parser_archive(self) -> None:
+        self.paths.bitcode.write_bytes(b"BC\xc0\xde")
+        with patch("scripts.pgso.pipeline.run_checked"):
+            with self.assertRaisesRegex(PgsoError, "Tree-sitter C archive"):
+                emit_bitcode(self.toolchain, self.spec, self.paths)
+            (self.paths.ir_prefix / "pgso/genome.a").write_bytes(b"archive")
+            self.assertEqual(sha256_file(self.paths.bitcode), emit_bitcode(self.toolchain, self.spec, self.paths))
 
     def test_open_reconstructs_an_existing_artifact_layout(self) -> None:
         marker = self.paths.bitcode
@@ -272,6 +292,11 @@ class PgsoPipelineTests(unittest.TestCase):
         self.assertIn("-mmacosx-version-min=13.0", instrumented)
         self.assertIn(str(self.toolchain.sdk), instrumented)
         self.assertIn(str(self.toolchain.profile_runtime), instrumented)
+        genome_archive = str(self.paths.ir_prefix / "pgso" / "genome.a")
+        self.assertIn(genome_archive, instrumented)
+        self.assertIn(genome_archive, candidate)
+        self.assertNotIn(genome_archive, candidate_object)
+        self.assertNotIn(genome_archive, benchmark_object)
         self.assertEqual(
             (
                 str(self.toolchain.zig),
@@ -282,6 +307,7 @@ class PgsoPipelineTests(unittest.TestCase):
                 "-Wl,-dead_strip",
                 "-s",
                 str(self.paths.profile_use_object),
+                str(self.paths.ir_prefix / "pgso" / "genome.a"),
                 "-o",
                 str(self.paths.candidate_binary),
                 "-lc",
@@ -341,7 +367,8 @@ with pathlib.Path({str(actions)!r}).open('a') as stream:
                 f"{self.paths.profile_use_bitcode} -o "
                 f"{self.paths.profile_use_object}",
                 "artifact cc -target aarch64-macos -O2 -Wl,-dead_strip -s "
-                f"{self.paths.profile_use_object} -o "
+                f"{self.paths.profile_use_object} "
+                f"{self.paths.ir_prefix / 'pgso' / 'genome.a'} -o "
                 f"{self.paths.candidate_binary} -lc",
                 f"strip -S -x {self.paths.candidate_binary}",
                 "codesign --force --sign - --options linker-signed "

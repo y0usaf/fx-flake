@@ -89,6 +89,7 @@ jobs:
             ${{ runner.temp }}/fx-pgso-seed/manifest.json
             ${{ runner.temp }}/fx-pgso-seed/control/bin/omfx
             ${{ runner.temp }}/fx-pgso-seed/ir/pgso/omfx.bc
+            ${{ runner.temp }}/fx-pgso-seed/ir/pgso/genome.a
             ${{ runner.temp }}/fx-pgso-seed/instrumented/omfx
             ${{ runner.temp }}/fx-pgso-seed/profiles/merged.profdata
             ${{ runner.temp }}/fx-pgso-seed/logs

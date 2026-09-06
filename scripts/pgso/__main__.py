@@ -357,7 +357,10 @@ def run_command(arguments: argparse.Namespace) -> pathlib.Path:
         recorder.stage(
             stage,
             "passed",
-            {"identity": dataclasses.asdict(identity)},
+            {
+                "identity": dataclasses.asdict(identity),
+                "genome_archive_sha256": sha256_file(paths.ir_prefix / "pgso" / "genome.a"),
+            },
         )
 
         stage = "instrumented"
