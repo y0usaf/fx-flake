@@ -1,3 +1,9 @@
+# oh-my-fx
+
+This fork follows upstream fx and adds embedded rush for clean captured shell commands and `ast_symbols` for structural symbol lookup in TypeScript, TSX, Python, Go, Rust, Nix, and Zig files. User-profile commands and interactive terminal sessions honor Bash/zsh selection and startup files.
+
+Build this checkout with `zig build` and run `./zig-out/bin/omfx`. The upstream documentation below describes fx; use the fork binary when running from this checkout.
+
 ```
  ⠀⠀⠀⠀⠀⠀⣠⣾⣿⣿⣿⠀⠀⠀⠀⠀⠀⠀⠀
  ⠀⠀⠀⠀⠀⢰⣿⡿⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀
@@ -219,3 +225,5 @@ Third-party licenses and attributions are listed in
 ## Credits
 
 Interface sounds by [cuelume](https://github.com/Danilaa1/cuelume).
+
+- [rush](https://github.com/rockorager/rush): embedded shell execution for clean captured commands.

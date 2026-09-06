@@ -656,7 +656,8 @@ function findFxProcessId(rows: readonly string[]): number | undefined {
     const match = row.trim().match(/^(\d+)\s+(.+)$/);
     if (!match) continue;
     const command = match[2]!;
-    if (command === "fx" || command === FX_BIN || command.endsWith("/fx")) {
+    if (command === "fx" || command === "omfx" || command === FX_BIN ||
+      command.endsWith("/fx") || command.endsWith("/omfx")) {
       return Number(match[1]);
     }
   }

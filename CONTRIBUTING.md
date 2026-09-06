@@ -37,7 +37,7 @@ zig build run
 
 ## Verification Workflow
 
-Keep the local development loop focused: run the narrowest test that covers the changed path, build fx, and exercise the change using `./zig-out/bin/fx`. The installed `fx` on `PATH` is not valid development evidence.
+Keep the local development loop focused: run the narrowest test that covers the changed path, build fx, and exercise the change using `./zig-out/bin/omfx`. The installed `fx` on `PATH` is not valid development evidence.
 
 Once the focused checks pass, create a clean checkpoint commit, push the non-`main` feature branch, and open a draft PR immediately. The **Full CI** workflow runs the complete deterministic suite on native Linux x86_64, Linux aarch64, macOS x86_64, and macOS aarch64 runners. The native matrix builds, tests, and smoke-tests ReleaseSafe on every platform; formatting and the public-surface audit run in those ReleaseSafe jobs. Four duration-balanced, isolated ReleaseSafe E2E shards per platform use checked-in weights to assign every Bun test file once; files inside each shard run sequentially in separate Bun processes so terminal fixtures and process state cannot leak between files. A failed file receives one bounded retry after tmux is reset.
 
@@ -405,7 +405,7 @@ the tape in `tests/e2e/tapes/<name>.fxtape` and assert against the built replay
 command:
 
 ```bash
-./zig-out/bin/fx replay tests/e2e/tapes/my-bug.fxtape --golden tests/e2e/tapes/my-bug.txt
+./zig-out/bin/omfx replay tests/e2e/tapes/my-bug.fxtape --golden tests/e2e/tapes/my-bug.txt
 ```
 
 Check in the golden file and wire a regression test that re-runs `fx replay` in CI and diffs.
@@ -499,7 +499,7 @@ Build the SDK artifacts and install the pinned Pi package first, as shown in
 Minimum checklist:
 
 1. Run `zig fmt --check src/` and the focused tests for the changed path.
-2. Run `zig build`, then exercise the change with `./zig-out/bin/fx`.
+2. Run `zig build`, then exercise the change with `./zig-out/bin/omfx`.
 3. Push the feature branch and open a draft PR immediately.
 4. Require all four **Full CI** jobs and the final ship gate to pass for the exact current commit before marking the PR ready.
 5. Update `README.md` if user-facing behavior changed.

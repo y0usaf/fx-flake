@@ -2054,6 +2054,10 @@ fn nativeCommandEnvironment(
             return error.InvalidCommandProfile
     else
         null;
+    if (execution_mode == .tty) {
+        const shell = try shell_resolver.profileShell(arena, configured, profile orelse .user);
+        return shell_resolver.environmentForShellSpec(arena, configured, shell);
+    }
     return shell_resolver.environment(arena, configured, profile);
 }
 

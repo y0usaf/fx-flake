@@ -435,6 +435,10 @@ fn addWasmArtifact(
     });
     if (surface == .core) wasm_exe.stack_size = 1024 * 1024;
     wasm_exe.root_module.addImport("build_options", wasm_options.createModule());
+    wasm_exe.root_module.addImport(
+        "genome",
+        addGenomeModule(b, "wasm", wasm_target, .ReleaseSmall),
+    );
 
     const install_wasm = b.addInstallArtifact(wasm_exe, .{});
     const wasm_step = b.step(name ++ "-wasm", description);
@@ -472,6 +476,10 @@ fn addNapiArtifact(
         }),
     });
     lib.root_module.addImport("build_options", napi_options.createModule());
+    lib.root_module.addImport(
+        "genome",
+        addGenomeModule(b, "napi", target, .ReleaseSafe),
+    );
     const node_include = b.option(
         []const u8,
         "node-include-dir",
