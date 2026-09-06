@@ -103,7 +103,15 @@ jobs:
               --cache-dir "$RUNNER_TEMP/fx-base-cache" \
               --global-cache-dir "$RUNNER_TEMP/fx-global-cache"
           )
-          cp "$base_worktree/zig-out/bin/omfx" "$evidence_dir/base-fx"
+          # Upstream main still names its freshly built executable `fx`; this
+          # fork names it `omfx`. Keep the comparison tied to the build output
+          # from the checked out revision rather than any installed binary.
+          base_binary="$base_worktree/zig-out/bin/omfx"
+          if [ ! -f "$base_binary" ]; then
+            base_binary="$base_worktree/zig-out/bin/fx"
+          fi
+          test -s "$base_binary"
+          cp "$base_binary" "$evidence_dir/base-fx"
           file "$evidence_dir/base-fx" > "$evidence_dir/base-file.txt"
           cat "$evidence_dir/base-file.txt"
           grep -Eq "$EXPECTED_FILE" "$evidence_dir/base-file.txt"
