@@ -208,23 +208,45 @@ pub const Resolver = struct {
             .parent_id = self.root_id,
             .options = self.child_store_options,
         };
-        var lock = store.acquireLock(alloc) catch |err| return switch (err) {
-            error.OutOfMemory => error.OutOfMemory,
-            else => error.StoreUnavailable,
+        const work_generation = blk: {
+            var lock = store.acquireLock(alloc) catch |err| return switch (err) {
+                error.OutOfMemory => error.OutOfMemory,
+                else => error.StoreUnavailable,
+            };
+            defer lock.release();
+            var registry = store.load(alloc) catch |err| return switch (err) {
+                error.OutOfMemory => error.OutOfMemory,
+                else => error.StoreUnavailable,
+            };
+            defer registry.deinit(alloc);
+            const child = registry.findById(child_id) orelse return error.ChildNotAttached;
+            if (child.active == null) return error.ChildNotAttached;
+            break :blk child.work_generation;
         };
-        defer lock.release();
-        var registry = store.load(alloc) catch |err| return switch (err) {
-            error.OutOfMemory => error.OutOfMemory,
-            else => error.StoreUnavailable,
-        };
-        defer registry.deinit(alloc);
-        const child = registry.findById(child_id) orelse return error.ChildNotAttached;
-        const permission_mode = if (child.active) |active|
-            active.permission_mode
-        else
-            return error.ChildNotAttached;
+
+        // Host resolution may connect MCP servers; parent state observation must remain available.
         var host = try self.host.resolve(alloc, self.root_id);
         defer host.deinit(alloc);
+
+        const current = blk: {
+            var lock = store.acquireLock(alloc) catch |err| return switch (err) {
+                error.OutOfMemory => error.OutOfMemory,
+                else => error.StoreUnavailable,
+            };
+            defer lock.release();
+            var registry = store.load(alloc) catch |err| return switch (err) {
+                error.OutOfMemory => error.OutOfMemory,
+                else => error.StoreUnavailable,
+            };
+            defer registry.deinit(alloc);
+            const child = registry.findById(child_id) orelse return error.ChildNotAttached;
+            const active = child.active orelse return error.ChildNotAttached;
+            if (child.work_generation != work_generation) return error.ChildNotAttached;
+            break :blk .{
+                .generation = registry.generation,
+                .permission_mode = active.permission_mode,
+            };
+        };
 
         const owned_child_id = try alloc.dupe(u8, child_id);
         errdefer alloc.free(owned_child_id);
@@ -258,7 +280,7 @@ pub const Resolver = struct {
             .generation = authorityGeneration(
                 child_id,
                 self.root_id,
-                registry.generation,
+                current.generation,
                 host.generation,
             ),
             .tools = tools,
@@ -266,7 +288,7 @@ pub const Resolver = struct {
             .rules = rules,
             .grants = try types.dupePermissionGrantSlice(alloc, host.grants),
             .permission_state = permission_state,
-            .permission_mode = permission_mode,
+            .permission_mode = current.permission_mode,
             .mcp_view = mcp_view,
         };
     }
@@ -459,4 +481,137 @@ test "tool authority excludes nested subagents and preserves rules" {
         .permission_mode = .yolo,
     }, "/tmp", "subagent", "subagent", .none);
     try std.testing.expectEqual(ToolAuthorityDecision.unavailable, decision);
+}
+
+test "authority capture permits registry access and rejects changed work" {
+    const io_mod = @import("../shared/io.zig");
+    const Fixture = struct {
+        const Change = enum { none, finish, replace, permission, sibling, host_failure };
+        store: child_state.Store,
+        change: Change,
+        calls: usize = 0,
+
+        fn resolve(raw: ?*anyopaque, alloc: Allocator, _: []const u8) HostResolveError!HostAuthority {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.calls += 1;
+            var lock = self.store.acquireLock(alloc) catch return error.HostAuthorityUnavailable;
+            defer lock.release();
+            var registry = self.store.load(alloc) catch return error.HostAuthorityUnavailable;
+            defer registry.deinit(alloc);
+            switch (self.change) {
+                .none => {},
+                .host_failure => return error.HostAuthorityUnavailable,
+                .finish, .replace => {
+                    registry.finish(alloc, "authority-child", "work-one", .completed, null) catch
+                        return error.HostAuthorityUnavailable;
+                    if (self.change != .finish) {
+                        var work = child_state.ActiveWork{
+                            .id = try alloc.dupe(u8, "work-two"),
+                            .message = try alloc.dupe(u8, "replacement"),
+                            .created_at_ms = 2,
+                        };
+                        defer work.deinit(alloc);
+                        _ = registry.startPersistentWork(alloc, "worker", null, work) catch
+                            return error.HostAuthorityUnavailable;
+                    }
+                },
+                .permission => {
+                    registry.children[0].active.?.permission_mode = .auto;
+                    registry.generation += 1;
+                },
+                .sibling => {
+                    var work = child_state.ActiveWork{
+                        .id = try alloc.dupe(u8, "sibling-work"),
+                        .message = try alloc.dupe(u8, "independent work"),
+                        .created_at_ms = 2,
+                    };
+                    defer work.deinit(alloc);
+                    registry.appendOneOff(alloc, "authority-sibling", work) catch
+                        return error.HostAuthorityUnavailable;
+                },
+            }
+            self.store.save(alloc, registry) catch return error.HostAuthorityUnavailable;
+            return HostAuthority.capture(alloc, &.{ "read_file", "subagent" }, &.{}, .{}, &.{}) catch
+                return error.OutOfMemory;
+        }
+    };
+
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(home);
+    var sessions = try session_store.Store.initFromHome(alloc, home, home);
+    defer sessions.deinit(alloc);
+    var state: @import("../session/session_codec.zig").DurableSessionState = .{
+        .id = try alloc.dupe(u8, "authority-parent"),
+        .origin_workspace_root = try alloc.dupe(u8, home),
+        .workspace_root = try alloc.dupe(u8, home),
+        .created_at_ms = 1,
+        .updated_at_ms = 1,
+        .conversation_language = @import("../session/session.zig").ConversationLanguage.literal("en"),
+        .preferences = .{
+            .model = try alloc.dupe(u8, "test/model"),
+            .effort = types.ReasoningEffort.literal("low"),
+            .fast_mode = false,
+        },
+        .history = &.{},
+        .total_input_tokens = 0,
+        .total_output_tokens = 0,
+    };
+    defer state.deinit(alloc);
+    var parent = try sessions.startWritableSession(alloc, state);
+    defer parent.deinit(alloc);
+    const store = child_state.Store{ .sessions = &sessions, .parent_id = state.id };
+
+    for (std.enums.values(Fixture.Change)) |change| {
+        var registry = try child_state.Registry.init(alloc, state.id);
+        defer registry.deinit(alloc);
+        var work = child_state.ActiveWork{
+            .id = try alloc.dupe(u8, "work-one"),
+            .message = try alloc.dupe(u8, "original"),
+            .permission_mode = .ask,
+            .created_at_ms = 1,
+        };
+        defer work.deinit(alloc);
+        try registry.appendPersistent(alloc, "authority-child", "worker", "", work);
+        try store.save(alloc, registry);
+        var fixture = Fixture{ .store = store, .change = change };
+        var resolver = Resolver{
+            .sessions = &sessions,
+            .root_id = state.id,
+            .host = .{ .context = &fixture, .resolve_fn = Fixture.resolve },
+        };
+        try std.testing.expectError(error.ChildNotAttached, resolver.resolve(alloc, "missing-child"));
+        try std.testing.expectEqual(@as(usize, 0), fixture.calls);
+        switch (change) {
+            .finish, .replace => try std.testing.expectError(
+                error.ChildNotAttached,
+                resolver.resolve(alloc, "authority-child"),
+            ),
+            .host_failure => try std.testing.expectError(
+                error.HostAuthorityUnavailable,
+                resolver.resolve(alloc, "authority-child"),
+            ),
+            .none, .permission, .sibling => {
+                var snapshot = try resolver.resolve(alloc, "authority-child");
+                defer snapshot.deinit(alloc);
+                try std.testing.expectEqual(
+                    if (change == .permission) types.PermissionMode.auto else types.PermissionMode.ask,
+                    snapshot.permission_mode,
+                );
+                try std.testing.expectEqual(@as(usize, 1), snapshot.tools.len);
+                try std.testing.expectEqualStrings("read_file", snapshot.tools[0]);
+                var current = try store.load(alloc);
+                defer current.deinit(alloc);
+                var host = try HostAuthority.capture(alloc, &.{ "read_file", "subagent" }, &.{}, .{}, &.{});
+                defer host.deinit(alloc);
+                try std.testing.expectEqual(
+                    authorityGeneration("authority-child", state.id, current.generation, host.generation),
+                    snapshot.generation,
+                );
+            },
+        }
+        try std.testing.expectEqual(@as(usize, 1), fixture.calls);
+    }
 }

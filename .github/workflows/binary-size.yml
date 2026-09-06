@@ -72,7 +72,7 @@ jobs:
             -Doptimize=ReleaseSafe \
             --cache-dir "$RUNNER_TEMP/fx-head-cache" \
             --global-cache-dir "$RUNNER_TEMP/fx-global-cache"
-          cp zig-out/bin/fx "$evidence_dir/head-fx"
+          cp zig-out/bin/omfx "$evidence_dir/head-fx"
           file "$evidence_dir/head-fx" > "$evidence_dir/head-file.txt"
           cat "$evidence_dir/head-file.txt"
           grep -Eq "$EXPECTED_FILE" "$evidence_dir/head-file.txt"
@@ -103,7 +103,7 @@ jobs:
               --cache-dir "$RUNNER_TEMP/fx-base-cache" \
               --global-cache-dir "$RUNNER_TEMP/fx-global-cache"
           )
-          cp "$base_worktree/zig-out/bin/fx" "$evidence_dir/base-fx"
+          cp "$base_worktree/zig-out/bin/omfx" "$evidence_dir/base-fx"
           file "$evidence_dir/base-fx" > "$evidence_dir/base-file.txt"
           cat "$evidence_dir/base-file.txt"
           grep -Eq "$EXPECTED_FILE" "$evidence_dir/base-file.txt"

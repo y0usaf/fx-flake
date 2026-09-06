@@ -1,4 +1,5 @@
 const std = @import("std");
+const build_options = @import("build_options");
 const app_lifecycle = @import("app_lifecycle.zig");
 const provider_runtime = @import("provider_runtime.zig");
 const app_input_runtime = @import("app_input_runtime.zig");
@@ -51,8 +52,6 @@ fn BootstrapDeps(comptime App: type) type {
             bool,
         ) anyerror!void;
         const InitializePersistenceFn = *const fn (*App, bool) anyerror!void;
-        const StageRequestedResumeViewFn = *const fn (*App) app_session_runtime.ResumeViewStage;
-        const PublishStagedResumeViewFn = *const fn (*App, u32) anyerror!void;
         const LoadSkillsFn = *const fn (
             Allocator,
             []const u8,
@@ -64,8 +63,6 @@ fn BootstrapDeps(comptime App: type) type {
         bootstrap_interactive_app: BootstrapInteractiveAppFn,
         configure_session_preferences: ConfigureSessionPreferencesFn,
         initialize_persistence: InitializePersistenceFn,
-        stage_requested_resume_view: StageRequestedResumeViewFn,
-        publish_staged_resume_view: PublishStagedResumeViewFn,
         load_mcp_runtime: mcp_runtime.LoadRuntimeFn,
         load_skills: LoadSkillsFn,
         skill_root_policy: skill_contract.RootPolicy,
@@ -101,8 +98,6 @@ pub fn Runtime(comptime App: type) type {
                 .bootstrap_interactive_app = bootstrapInteractiveAppDefault,
                 .configure_session_preferences = configureSessionPreferencesDefault,
                 .initialize_persistence = initializePersistenceDefault,
-                .stage_requested_resume_view = stageRequestedResumeViewDefault,
-                .publish_staged_resume_view = publishStagedResumeViewDefault,
                 .load_mcp_runtime = capability_providers.load_mcp_runtime,
                 .load_skills = app_runtime_setup.loadSkills,
                 .skill_root_policy = capability_providers.skill_root_policy,
@@ -125,14 +120,6 @@ pub fn Runtime(comptime App: type) type {
                 app,
                 required,
             );
-        }
-
-        fn stageRequestedResumeViewDefault(app: *App) app_session_runtime.ResumeViewStage {
-            return app_session_runtime.Runtime(App).stageRequestedResumeView(app);
-        }
-
-        fn publishStagedResumeViewDefault(app: *App, entry_id: u32) !void {
-            try app_session_runtime.Runtime(App).publishStagedResumeView(app, entry_id);
         }
 
         fn configureSessionPreferencesDefault(
@@ -222,6 +209,7 @@ pub fn Runtime(comptime App: type) type {
             app.auth.recordStartupStatus(
                 startup.stored_key_status,
                 startup.fx_login_status,
+                startup.credential_load_failure,
                 startup.credential_onboarding_skipped,
             );
             if (comptime @hasDecl(@TypeOf(app.auth), "refreshSourceInventory")) {
@@ -322,10 +310,6 @@ pub fn Runtime(comptime App: type) type {
                 app,
                 app.requested_resume != null,
             );
-            const staged_resume_view = if (app.requested_resume != null)
-                deps.stage_requested_resume_view(app)
-            else
-                app_session_runtime.ResumeViewStage.none;
             const profile_mcp = try deps.load_mcp_runtime(
                 app.alloc,
                 app.workspace_root,
@@ -388,19 +372,19 @@ pub fn Runtime(comptime App: type) type {
             }
             if (comptime @hasField(App, "auth")) {
                 const auth_view = app.auth.view();
-                if (auth_view.active_source == null and auth_view.stored_key_status == .unavailable) {
-                    debug_trace.logf("keychain", "interactive read skipped", .{});
-                    try app.writeDomainNotice(.{
-                        .topic = "keychain",
-                        .tone = .warning,
-                        .body = "fx could not access " ++ credentials.stored_key_backend_label ++ ". Continuing without an API key.",
-                    }, true);
-                }
-                if (auth_view.active_source == null and auth_view.fx_login_status == .unavailable) {
+                const load_error: ?anyerror = if (startup.credential_load_failure) |failure|
+                    failure.err
+                else if (auth_view.stored_key_status == .unavailable or auth_view.fx_login_status == .unavailable)
+                    error.CredentialStorageUnavailable
+                else
+                    null;
+                if (auth_view.active_source == null and load_error != null) {
+                    const body = try auth_runtime.preparationFailureText(app.alloc, startup.provider, load_error.?);
+                    defer app.alloc.free(body);
                     try app.writeDomainNotice(.{
                         .topic = "auth",
                         .tone = .warning,
-                        .body = "The saved fx login could not be loaded. No other credential was selected; run /login to repair this source.",
+                        .body = body,
                     }, true);
                 }
             }
@@ -481,10 +465,6 @@ pub fn Runtime(comptime App: type) type {
                 app_session_runtime.Runtime(App).syncTerminalTitleWith(app, deps.terminal_title);
             }
 
-            switch (staged_resume_view) {
-                .none => {},
-                .ready => |entry_id| try deps.publish_staged_resume_view(app, entry_id),
-            }
             app.shell.render_requests.request(.first_frame);
         }
     };
@@ -659,8 +639,6 @@ fn testDeps() BootstrapDeps(TestApp) {
         .bootstrap_interactive_app = bootstrapInteractiveAppForTest,
         .configure_session_preferences = configureSessionPreferencesForTest,
         .initialize_persistence = initializePersistenceForTest,
-        .stage_requested_resume_view = stageRequestedResumeViewForTest,
-        .publish_staged_resume_view = publishStagedResumeViewForTest,
         .load_mcp_runtime = loadMcpRuntimeForTest,
         .load_skills = loadSkillsForTest,
         .skill_root_policy = .{
@@ -754,16 +732,6 @@ fn initializePersistenceForTest(
 ) !void {
     _ = app;
     active_capture.?.initialize_required = required;
-}
-
-fn stageRequestedResumeViewForTest(_: *TestApp) app_session_runtime.ResumeViewStage {
-    active_capture.?.recordEvent("resume_view_stage");
-    return .{ .ready = 1 };
-}
-
-fn publishStagedResumeViewForTest(_: *TestApp, entry_id: u32) !void {
-    try std.testing.expectEqual(@as(u32, 1), entry_id);
-    active_capture.?.recordEvent("resume_view_publish");
 }
 
 fn loadMcpRuntimeForTest(_: Allocator, _: []const u8, _: @import("../mcp/elicitation.zig").Capabilities) !?*mcp_runtime.McpRuntime {
@@ -942,7 +910,7 @@ test "app_bootstrap_runtime transfers startup state and starts a fresh session" 
     try std.testing.expectEqualStrings("title", events[5]);
     try std.testing.expectEqual(@as(usize, 1), capture.begin_calls);
     try std.testing.expectEqual(@as(usize, 1), capture.enable_calls);
-    try std.testing.expectEqualStrings("workspace · model-x", capture.titleText());
+    try std.testing.expectEqualStrings("v" ++ build_options.app_version ++ " | workspace", capture.titleText());
 
     try std.testing.expectEqualStrings("/workspace", app.workspace_root);
     try std.testing.expectEqualStrings("api-key", app.auth.apiKey().?);
@@ -987,7 +955,7 @@ test "app_bootstrap_runtime opens onboarding before first frame without a creden
     try std.testing.expect(app.shell.render_requests.hasReason(.first_frame));
 }
 
-test "app_bootstrap_runtime stages requested sessions with the first frame pending" {
+test "app_bootstrap_runtime defers requested session loading until after bootstrap" {
     const alloc = std.testing.allocator;
     var capture = TestCapture.init(alloc);
     var app = TestApp.init(alloc);
@@ -1006,13 +974,14 @@ test "app_bootstrap_runtime stages requested sessions with the first frame pendi
     try std.testing.expectEqualStrings("", app.transcript.items);
     try std.testing.expect(!app.transcript_recorded);
     const events = capture.eventSlice();
-    try std.testing.expectEqualStrings("resume_view_stage", events[0]);
-    try std.testing.expectEqualStrings("load_mcp", events[1]);
-    try std.testing.expectEqualStrings("load_skills", events[2]);
-    try std.testing.expectEqualStrings("resume_view_publish", events[3]);
+    try std.testing.expectEqualSlices(
+        []const u8,
+        &.{ "load_mcp", "load_skills" },
+        events,
+    );
 }
 
-test "app_bootstrap_runtime publishes a staged resume view after startup notices" {
+test "app_bootstrap_runtime renders startup notices without a resume cache" {
     const alloc = std.testing.allocator;
     var capture = TestCapture.init(alloc);
     capture.emit_skill_diagnostic = true;
@@ -1025,12 +994,10 @@ test "app_bootstrap_runtime publishes a staged resume view after startup notices
     try std.testing.expectEqualSlices(
         []const u8,
         &.{
-            "resume_view_stage",
             "load_mcp",
             "load_skills",
             "welcome",
             "welcome",
-            "resume_view_publish",
         },
         capture.eventSlice(),
     );

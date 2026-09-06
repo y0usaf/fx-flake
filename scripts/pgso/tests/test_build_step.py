@@ -51,7 +51,7 @@ class PgsoBuildStepTests(unittest.TestCase):
         )
 
     def test_fx_ir_step_emits_release_safe_bitcode(self) -> None:
-        self.assert_emits_bitcode("fx", "fx.bc")
+        self.assert_emits_bitcode("omfx", "omfx.bc")
 
     def test_benchmark_ir_step_emits_release_safe_bitcode(self) -> None:
         cases = {

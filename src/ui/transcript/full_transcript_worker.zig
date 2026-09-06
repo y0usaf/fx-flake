@@ -154,9 +154,13 @@ pub const Source = struct {
 pub const InstalledSource = struct {
     request: full_transcript_page.Request,
     range: full_transcript_page.SourceRange,
+    // Stored projection segments borrow the snapshot's result and handle bytes.
+    details: std.ArrayList(transcript_blocks.ToolDetailRecord) = .empty,
     capability: ?session_child_store.SessionChildCapability = null,
 
-    pub fn deinit(self: *InstalledSource) void {
+    pub fn deinit(self: *InstalledSource, alloc: Allocator) void {
+        for (self.details.items) |*detail| detail.deinit(alloc);
+        self.details.deinit(alloc);
         if (self.capability) |*capability| capability.deinit();
         self.* = undefined;
     }
@@ -202,11 +206,14 @@ pub const Task = struct {
     }
 
     pub fn takeInstalledSource(self: *Task) InstalledSource {
+        const details = self.source.details;
+        self.source.details = .empty;
         const capability = self.source.capability;
         self.source.capability = null;
         return .{
             .request = self.source.request,
             .range = self.source.range,
+            .details = details,
             .capability = capability,
         };
     }
@@ -345,6 +352,103 @@ pub fn cloneCommandBlockForPageSnapshot(
     }
     try clone.pruned_ranges.appendSlice(alloc, source.pruned_ranges.items);
     return clone;
+}
+
+test "installed projection retains saved output and fallback after source disposal" {
+    const alloc = std.testing.allocator;
+    const io_mod = @import("../../core/shared/io.zig");
+    const result_store = @import("../../core/session/result_store.zig");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(path);
+
+    var task = Task{ .source = .{
+        .request = .{ .content_revision = 1, .cols = 80, .anchor = .tail },
+        .range = .{ .start = 0, .end = 1 },
+        .styles = .{},
+        .capability = try session_child_store.SessionChildCapability.initLegacyRoute(
+            alloc,
+            path,
+            .tool_results,
+            .writable,
+        ),
+    } };
+    var source_owned = true;
+    defer if (source_owned) task.source.deinit(alloc);
+    try task.source.details.ensureTotalCapacity(alloc, 1);
+    task.source.details.appendAssumeCapacity(.{
+        .entry_id = 1,
+        .tool_name = try alloc.dupe(u8, "read_file"),
+    });
+    const detail = &task.source.details.items[0];
+    detail.result = try alloc.dupe(u8, "retained preview");
+    detail.result_handle = try result_store.storeLargeResultManaged(
+        alloc,
+        &task.source.capability.?,
+        "installed-result",
+        "read_file",
+        "SAVED_HEAD\nSAVED_TAIL\n",
+    );
+    const entries = [_]transcript_blocks.TranscriptEntry{.{ .raw_bytes = .{
+        .id = 1,
+        .created_at_ms = 0,
+        .bytes = @constCast("Read fixture.txt\n"),
+        .class = .tool_status,
+    } }};
+    var projection = try full_transcript_screen.buildProjection(
+        alloc,
+        &entries,
+        task.source.details.items,
+        &.{},
+        .{},
+        80,
+        null,
+    );
+    var installed = task.takeInstalledSource();
+    defer installed.deinit(alloc);
+    defer projection.deinit(alloc);
+    task.source.deinit(alloc);
+    source_owned = false;
+
+    const rendered = try full_transcript_screen.renderProjectionViewportSourceInterruptible(
+        alloc,
+        &projection,
+        &installed.capability.?,
+        80,
+        20,
+        0,
+        null,
+    );
+    defer alloc.free(rendered);
+    try std.testing.expect(std.mem.find(u8, rendered, "SAVED_HEAD") != null);
+    try std.testing.expect(std.mem.find(u8, rendered, "SAVED_TAIL") != null);
+    try std.testing.expect(std.mem.find(u8, rendered, "Full saved result unavailable.") == null);
+
+    // A newly built view must still have a readable preview if the file disappears.
+    try result_store.deleteManaged(&installed.capability.?, installed.details.items[0].result_handle.?);
+    var missing = try full_transcript_screen.buildProjection(
+        alloc,
+        &entries,
+        installed.details.items,
+        &.{},
+        .{},
+        80,
+        null,
+    );
+    defer missing.deinit(alloc);
+    const fallback = try full_transcript_screen.renderProjectionViewportSourceInterruptible(
+        alloc,
+        &missing,
+        &installed.capability.?,
+        80,
+        20,
+        0,
+        null,
+    );
+    defer alloc.free(fallback);
+    try std.testing.expect(std.mem.find(u8, fallback, "retained preview") != null);
+    try std.testing.expect(std.mem.find(u8, fallback, "Full saved result unavailable.") != null);
 }
 
 pub const Load = struct {

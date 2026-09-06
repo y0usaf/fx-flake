@@ -221,6 +221,8 @@ pub const State = struct {
     fn rawFilePickerQuery(self: *const State, editor: *const editor_state.State) ?FilePickerQuery {
         if (self.rawModelPickerQuery(editor) != null) return null;
         if (self.rawProviderPickerQuery(editor) != null) return null;
+        const command_text = std.mem.trimStart(u8, editor.input.items, " \t\r\n");
+        if (tokenMatchesAt(command_text, 0, "/mcp")) return null;
         return findFilePickerQuery(editor.input.items, editor.cursor);
     }
 
@@ -722,6 +724,60 @@ test "model picker query takes precedence over file syntax" {
     try editor.setText(alloc, "/model @provider");
     try std.testing.expect(state.activeModelPickerQuery(&editor) != null);
     try std.testing.expectEqual(@as(?FilePickerQuery, null), state.activeFilePickerQuery(&editor));
+}
+
+test "MCP arguments stay literal while ordinary file queries remain eligible" {
+    const alloc = std.testing.allocator;
+    var editor: editor_state.State = .{};
+    defer editor.deinit(alloc);
+    var state: State = .{};
+    defer state.deinit(alloc);
+
+    const literal_inputs = [_][]const u8{
+        "/mcp add memory npx -y @modelcontextprotocol/server-memory@2026.8.31",
+        " \t/mcp\tadd memory npx @scope/package",
+        "\n/mcp add memory npx @scope/package",
+    };
+    for (literal_inputs) |input| {
+        try editor.setText(alloc, input);
+        try std.testing.expect(state.activeFilePickerQuery(&editor) == null);
+        try std.testing.expect(state.inlinePickerTriggerKind(&editor) != .file);
+        _ = editor.setCursor(input.len - 1);
+        try std.testing.expect(state.activeFilePickerQuery(&editor) == null);
+    }
+
+    const file_inputs = [_][]const u8{
+        "read @src/main.zig",
+        "/mcpx @src/main.zig",
+        "explain /mcp @src/main.zig",
+        "/review @src/main.zig",
+    };
+    for (file_inputs) |input| {
+        try editor.setText(alloc, input);
+        try std.testing.expectEqualStrings("src/main.zig", state.activeFilePickerQuery(&editor).?.query);
+        try std.testing.expectEqual(InlinePickerKind.file, state.inlinePickerTriggerKind(&editor).?);
+    }
+}
+
+test "MCP argument edits and history do not retain file picker ownership" {
+    const alloc = std.testing.allocator;
+    var editor: editor_state.State = .{};
+    defer editor.deinit(alloc);
+    var state: State = .{};
+    defer state.deinit(alloc);
+
+    try editor.setText(alloc, "read @scope/package");
+    state.dismissInlinePicker(.file);
+    try editor.setText(alloc, "/mcp add memory npx @scope/package");
+    state.reconcileInlinePickerAfterEdit(&editor);
+    try std.testing.expect(!state.isInlinePickerSuppressed(.file));
+    state.resetInlinePickerForHistoryRecall(&editor);
+    try std.testing.expect(state.activeFilePickerQuery(&editor) == null);
+    try std.testing.expect(state.inlinePickerTriggerKind(&editor) != .file);
+
+    try editor.setText(alloc, "read @scope/package");
+    state.reconcileInlinePickerAfterEdit(&editor);
+    try std.testing.expectEqualStrings("scope/package", state.activeFilePickerQuery(&editor).?.query);
 }
 
 test "picker dismissal lasts for one trigger episode" {

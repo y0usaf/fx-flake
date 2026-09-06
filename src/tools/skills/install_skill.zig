@@ -316,6 +316,7 @@ test "run command compatibility reports managed filesystem failures" {
     }, command);
 
     switch (result) {
+        .rich => return error.TestUnexpectedRichResult,
         .success => try std.testing.expect(false),
         .failure => |body| try std.testing.expect(tool_result_errors.isToolExecutionFailedOutput(body)),
     }

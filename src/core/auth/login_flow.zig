@@ -247,6 +247,7 @@ pub const CompleteSignInFn = *const fn (
     *oauth.TokenSet,
 ) anyerror!SignInCompletion;
 pub const SaveSignInFn = *const fn (?*anyopaque, Allocator, SignInCompletion) anyerror!void;
+pub const FinishSignInFn = *const fn (?*anyopaque, Allocator, bool) void;
 pub const DeinitSignInContextFn = *const fn (?*anyopaque, Allocator) void;
 pub const SubmitManualCodeFn = *const fn (?*anyopaque, Allocator, []const u8) anyerror!void;
 
@@ -257,6 +258,7 @@ pub const SignInRuntimeDeps = struct {
     poll: LoginPollDeps = .{},
     complete: CompleteSignInFn = completeSignIn,
     save: SaveSignInFn = saveSignIn,
+    finish: ?FinishSignInFn = null,
     submit_manual_code: ?SubmitManualCodeFn = null,
 };
 
@@ -438,6 +440,7 @@ pub const SignInRuntime = struct {
     }
 
     fn workerMain(self: *Self, alloc: Allocator) void {
+        defer self.finishAttempt(alloc);
         const flow = if (self.flow) |*prepared| prepared else return;
         var prompt = BrowserOpenPrompt{ .url = flow.device.verification_uri };
         var token = pollForTokenWithDeps(
@@ -464,6 +467,7 @@ pub const SignInRuntime = struct {
 
     fn pulseCooperative(self: *Self, alloc: Allocator) void {
         if (self.state != .polling) return;
+        defer self.finishAttempt(alloc);
         const flow = if (self.flow) |*prepared| prepared else return;
         const poll_state = if (self.poll_state) |*state| state else {
             self.publishFailure(error.LoginPollStateMissing);
@@ -520,7 +524,7 @@ pub const SignInRuntime = struct {
         }
         self.deps.save(self.deps.ctx, alloc, completion) catch |err| {
             debug_trace.logf("auth", "sign-in session save failed err={s}", .{@errorName(err)});
-            self.failure = err;
+            self.failure = signInPersistenceError(err);
             self.state = .failed;
             return;
         };
@@ -548,6 +552,7 @@ pub const SignInRuntime = struct {
     }
 
     fn clearFlow(self: *Self, alloc: Allocator) void {
+        self.finishAttempt(alloc);
         self.mutex.lockUncancelable(io_mod.getIo());
         var flow = self.flow;
         const deps = self.deps;
@@ -558,12 +563,29 @@ pub const SignInRuntime = struct {
         if (flow) |*prepared| prepared.deinit(alloc);
         if (deps.deinit_ctx) |deinit_ctx| deinit_ctx(deps.ctx, alloc);
     }
+
+    // Notify once after persistence, outside the state lock. A disconnected
+    // browser cannot turn a committed credential into a failed sign-in.
+    fn finishAttempt(self: *Self, alloc: Allocator) void {
+        self.mutex.lockUncancelable(io_mod.getIo());
+        if (self.state == .polling) {
+            self.mutex.unlock(io_mod.getIo());
+            return;
+        }
+        const finish = self.deps.finish;
+        self.deps.finish = null;
+        const ctx = self.deps.ctx;
+        const saved = self.state == .succeeded;
+        self.mutex.unlock(io_mod.getIo());
+        if (finish) |notify| notify(ctx, alloc, saved);
+    }
 };
 
 fn prepareLogin(
     alloc: Allocator,
     transport: oauth_transport.Provider,
 ) !PreparedLogin {
+    try credentials.requireSignInStorage(.fx_login);
     var client_id = oauth_session.configuredClientId() orelse return LoginError.ClientIdMissing;
     const issuer_url = try oauth_session.configuredIssuerUrl();
 
@@ -611,6 +633,10 @@ fn saveSignIn(_: ?*anyopaque, alloc: Allocator, completion: SignInCompletion) !v
     try oauth_session.saveNewSession(alloc, session);
 }
 
+fn signInPersistenceError(err: anyerror) (Allocator.Error || error{CredentialPersistenceFailed}) {
+    return if (err == error.OutOfMemory) error.OutOfMemory else error.CredentialPersistenceFailed;
+}
+
 pub fn runLogin(
     alloc: Allocator,
     transport: oauth_transport.Provider,
@@ -656,7 +682,10 @@ pub fn runLogin(
     );
     defer session.deinit(alloc);
 
-    try oauth_session.saveNewSession(alloc, session);
+    oauth_session.saveNewSession(alloc, session) catch |err| {
+        debug_trace.logf("auth", "sign-in session save failed err={s}", .{@errorName(err)});
+        return signInPersistenceError(err);
+    };
 }
 
 fn take_login_session(
@@ -1787,6 +1816,9 @@ const CooperativeSignInTestState = struct {
     complete_count: usize = 0,
     save_count: usize = 0,
     fail_save: bool = false,
+    finish_count: usize = 0,
+    finished_saved: bool = false,
+    saves_at_finish: usize = 0,
 
     fn init(alloc: Allocator, results: []const ScriptedPollResult) @This() {
         return .{ .poll = LoginPollTestState.init(alloc, results) };
@@ -1802,6 +1834,7 @@ const CooperativeSignInTestState = struct {
             .poll = self.poll.deps(),
             .complete = complete,
             .save = save,
+            .finish = finish,
         };
     }
 
@@ -1830,10 +1863,57 @@ const CooperativeSignInTestState = struct {
         if (self.fail_save) return error.TestStoreCommitFailed;
     }
 
+    fn finish(raw: ?*anyopaque, _: Allocator, saved: bool) void {
+        const self = state(raw);
+        self.finish_count += 1;
+        self.finished_saved = saved;
+        self.saves_at_finish = self.save_count;
+    }
+
     fn state(raw: ?*anyopaque) *@This() {
         return @ptrCast(@alignCast(raw.?));
     }
 };
+
+test "sign-in notifies once after persistence succeeds or fails" {
+    const alloc = std.testing.allocator;
+    for ([_]bool{ false, true }) |fail_save| {
+        var runtime: SignInRuntime = .{};
+        defer runtime.deinit(alloc);
+        var state = CooperativeSignInTestState.init(alloc, &.{.success});
+        defer state.deinit();
+        state.fail_save = fail_save;
+        try std.testing.expect(try runtime.startPreparedCooperative(alloc, try makeTestPreparedLogin(alloc), state.deps()));
+        try std.testing.expectEqual(@as(usize, 0), state.finish_count);
+        runtime.pulseCooperative(alloc);
+        try std.testing.expectEqual(@as(usize, 1), state.finish_count);
+        try std.testing.expectEqual(@as(usize, 1), state.saves_at_finish);
+        try std.testing.expectEqual(!fail_save, state.finished_saved);
+        var transition = runtime.pollTransition(alloc);
+        switch (transition) {
+            .succeeded => |*completion| completion.deinit(alloc),
+            .failed => try std.testing.expect(fail_save),
+            else => return error.TestExpectedTerminalSignIn,
+        }
+        _ = runtime.cancel(alloc);
+        try std.testing.expectEqual(@as(usize, 1), state.finish_count);
+    }
+}
+
+test "sign-in cancellation notifies failure without saving" {
+    const alloc = std.testing.allocator;
+    var runtime: SignInRuntime = .{};
+    defer runtime.deinit(alloc);
+    var state = CooperativeSignInTestState.init(alloc, &.{.success});
+    defer state.deinit();
+    try std.testing.expect(try runtime.startPreparedCooperative(alloc, try makeTestPreparedLogin(alloc), state.deps()));
+    try std.testing.expect(runtime.cancel(alloc));
+    try std.testing.expectEqual(@as(usize, 1), state.finish_count);
+    try std.testing.expectEqual(@as(usize, 0), state.saves_at_finish);
+    try std.testing.expect(!state.finished_saved);
+    _ = runtime.pollTransition(alloc);
+    try std.testing.expectEqual(@as(usize, 1), state.finish_count);
+}
 
 fn makeTestPreparedLogin(alloc: Allocator) !PreparedLogin {
     var metadata = try oauth.parseMetadata(
@@ -2106,7 +2186,7 @@ test "cooperative sign-in store failure is traced and becomes a recoverable tran
     runtime.pulseCooperative(alloc);
 
     switch (runtime.pollTransition(alloc)) {
-        .failed => |err| try std.testing.expectEqual(error.TestStoreCommitFailed, err),
+        .failed => |err| try std.testing.expectEqual(error.CredentialPersistenceFailed, err),
         else => return error.TestExpectedStoreFailure,
     }
     debug_trace.shutdown();

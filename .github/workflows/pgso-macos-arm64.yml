@@ -87,9 +87,9 @@ jobs:
           name: pgso-seed-${{ github.sha }}
           path: |
             ${{ runner.temp }}/fx-pgso-seed/manifest.json
-            ${{ runner.temp }}/fx-pgso-seed/control/bin/fx
-            ${{ runner.temp }}/fx-pgso-seed/ir/pgso/fx.bc
-            ${{ runner.temp }}/fx-pgso-seed/instrumented/fx
+            ${{ runner.temp }}/fx-pgso-seed/control/bin/omfx
+            ${{ runner.temp }}/fx-pgso-seed/ir/pgso/omfx.bc
+            ${{ runner.temp }}/fx-pgso-seed/instrumented/omfx
             ${{ runner.temp }}/fx-pgso-seed/profiles/merged.profdata
             ${{ runner.temp }}/fx-pgso-seed/logs
           if-no-files-found: error
@@ -130,7 +130,7 @@ jobs:
           path: ${{ runner.temp }}/fx-pgso-seed
 
       - name: Restore executable mode
-        run: chmod +x "$RUNNER_TEMP/fx-pgso-seed/instrumented/fx" "$RUNNER_TEMP/fx-pgso-seed/control/bin/fx"
+        run: chmod +x "$RUNNER_TEMP/fx-pgso-seed/instrumented/omfx" "$RUNNER_TEMP/fx-pgso-seed/control/bin/omfx"
 
       - name: Run assigned training scenarios
         run: |
@@ -187,7 +187,7 @@ jobs:
           path: ${{ runner.temp }}/fx-pgso-training
 
       - name: Restore executable mode
-        run: chmod +x "$RUNNER_TEMP/fx-pgso-seed/instrumented/fx" "$RUNNER_TEMP/fx-pgso-seed/control/bin/fx"
+        run: chmod +x "$RUNNER_TEMP/fx-pgso-seed/instrumented/omfx" "$RUNNER_TEMP/fx-pgso-seed/control/bin/omfx"
 
       - name: Build the one production candidate
         run: |
@@ -205,8 +205,8 @@ jobs:
           path: |
             ${{ runner.temp }}/fx-pgso-candidate/manifest.json
             ${{ runner.temp }}/fx-pgso-candidate/failure.json
-            ${{ runner.temp }}/fx-pgso-candidate/control/bin/fx
-            ${{ runner.temp }}/fx-pgso-candidate/candidate/fx
+            ${{ runner.temp }}/fx-pgso-candidate/control/bin/omfx
+            ${{ runner.temp }}/fx-pgso-candidate/candidate/omfx
             ${{ runner.temp }}/fx-pgso-candidate/profiles/merged.profdata
             ${{ runner.temp }}/fx-pgso-candidate/profiles/supplements
             ${{ runner.temp }}/fx-pgso-candidate/heavy/file_index/external-control/file-index-bench
@@ -263,7 +263,7 @@ jobs:
           path: ${{ runner.temp }}/fx-pgso-candidate
 
       - name: Restore executable mode
-        run: chmod +x "$RUNNER_TEMP/fx-pgso-candidate/candidate/fx" "$RUNNER_TEMP/fx-pgso-candidate/control/bin/fx"
+        run: chmod +x "$RUNNER_TEMP/fx-pgso-candidate/candidate/omfx" "$RUNNER_TEMP/fx-pgso-candidate/control/bin/omfx"
 
       - name: Run assigned behavior scenarios
         run: |
@@ -318,7 +318,7 @@ jobs:
           path: ${{ runner.temp }}/fx-pgso-candidate
 
       - name: Restore executable mode
-        run: chmod +x "$RUNNER_TEMP/fx-pgso-candidate/candidate/fx" "$RUNNER_TEMP/fx-pgso-candidate/control/bin/fx"
+        run: chmod +x "$RUNNER_TEMP/fx-pgso-candidate/candidate/omfx" "$RUNNER_TEMP/fx-pgso-candidate/control/bin/omfx"
 
       - name: Measure same-runner control and candidate
         run: |
@@ -369,8 +369,8 @@ jobs:
       - name: Restore executable mode
         run: |
           chmod +x \
-            "$RUNNER_TEMP/fx-pgso-candidate/candidate/fx" \
-            "$RUNNER_TEMP/fx-pgso-candidate/control/bin/fx" \
+            "$RUNNER_TEMP/fx-pgso-candidate/candidate/omfx" \
+            "$RUNNER_TEMP/fx-pgso-candidate/control/bin/omfx" \
             "$RUNNER_TEMP/fx-pgso-candidate/heavy/file_index/external-control/file-index-bench" \
             "$RUNNER_TEMP/fx-pgso-candidate/heavy/file_index/candidate/file-index-bench" \
             "$RUNNER_TEMP/fx-pgso-candidate/heavy/ui_activity/external-control/ui-activity-progress-bench" \
@@ -438,7 +438,7 @@ jobs:
           path: ${{ runner.temp }}/fx-pgso-heavy
 
       - name: Restore executable mode
-        run: chmod +x "$RUNNER_TEMP/fx-pgso-candidate/candidate/fx" "$RUNNER_TEMP/fx-pgso-candidate/control/bin/fx"
+        run: chmod +x "$RUNNER_TEMP/fx-pgso-candidate/candidate/omfx" "$RUNNER_TEMP/fx-pgso-candidate/control/bin/omfx"
 
       - name: Aggregate fail-closed evidence
         run: |

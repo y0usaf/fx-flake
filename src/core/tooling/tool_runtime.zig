@@ -1,4 +1,5 @@
 const std = @import("std");
+const skill_contract = @import("../skills/skill_contract.zig");
 const builtin = @import("builtin");
 const agent_stream_provider = @import("../agent/stream_provider.zig");
 const auth_runtime = @import("../auth/auth_runtime.zig");
@@ -111,6 +112,7 @@ test {
     _ = tool_admission;
     _ = command_result_mapping;
     _ = @import("../session/command_replay_store.zig");
+    _ = @import("../session/result_store.zig");
     _ = file_mutation_execution;
     _ = tool_presentation;
 }
@@ -127,7 +129,6 @@ pub const Context = struct {
     max_tool_result_bytes: usize = tool_result_limits.default_max_tool_result_bytes,
     api_key: []const u8,
     agent_stream_provider: agent_stream_provider.Provider = agent_stream_provider.unavailable_provider,
-    compaction_route: provider_set.CompactionRouteDecision = .{ .unavailable = .missing_policy },
     gateway_team: ?[]const u8 = null,
     credential_source: ?types.CredentialSource = null,
     account_id: ?[]const u8 = null,
@@ -169,6 +170,7 @@ pub const Context = struct {
     session: *SessionRuntime,
     session_allocator: Allocator = std.heap.c_allocator,
     skills_dir: []const u8 = "",
+    skill_locations: ?*const skill_contract.Locations = null,
     context_limits: context_limits.Values = .{},
     context_registry: context_contract.Registry,
     context_enabled: bool = true,
@@ -192,7 +194,10 @@ pub const Context = struct {
     mcp_call_tool: ?tool_mcp_runtime.CallToolFn = null,
     mcp_search_tools: ?tool_mcp_runtime.SearchToolsFn = null,
     mcp_tool_schema: ?tool_mcp_runtime.ToolSchemaFn = null,
+    mcp_snapshot_tool: ?tool_mcp_runtime.SnapshotToolFn = null,
     expected_mcp_runtime_generation: ?u64 = null,
+    expected_mcp_binding: ?types.McpToolBinding = null,
+    mcp_review_schema_json: ?[]const u8 = null,
     mcp_call_feature: ?tool_mcp_runtime.FeatureCallFn = null,
     mcp_access: tool_mcp_runtime.Access = .unrestricted,
     mcp_input_responder: ?tool_mcp_runtime.InputResponder = null,
@@ -239,6 +244,7 @@ pub const Context = struct {
             },
             .tool_registry = self.tool_registry,
             .worker = self.worker,
+            .mcp_review_schema_json = self.mcp_review_schema_json,
             .permission_prompter = self.permission_prompter,
             .advertised_dynamic_tool_names = self.advertised_dynamic_tool_names,
             .mcp_runtime = mcpRuntimeCapabilities(self),
@@ -355,6 +361,7 @@ pub fn executeToolCallAuthorized(
         request.command_replay_capture.?.abort(request.result_allocator);
     };
     var execution_ctx = ctx;
+    execution_ctx.skill_locations = request.skill_locations orelse ctx.skill_locations;
     if (request.permission_mode) |permission_mode| {
         execution_ctx.permission_mode = permission_mode;
     }
@@ -382,6 +389,7 @@ pub fn executeToolCallAuthorized(
     }
     execution_ctx.max_tool_result_bytes = request.max_tool_result_bytes;
     execution_ctx.expected_mcp_runtime_generation = request.expected_mcp_runtime_generation;
+    execution_ctx.expected_mcp_binding = request.expected_mcp_binding;
     execution_ctx.current_turn_messages = request.current_turn_messages;
     execution_ctx.output_chunk_lifecycle_id = request.lifecycle_id;
     execution_ctx.command_timeout_started_ms = request.command_timeout_started_ms;
@@ -767,6 +775,7 @@ fn executeRegisteredTool(
     dispatch_ctx.execution_authority = authority;
     dispatch_ctx.mcp_call_options = .{
         .expected_runtime_generation = ctx.expected_mcp_runtime_generation,
+        .expected_binding = ctx.expected_mcp_binding,
         .cancel_flag = dispatch_ctx.cancel_flag,
         .progress = .{
             .context = @ptrCast(&mcp_progress_bridge),
@@ -817,6 +826,7 @@ fn executeRegisteredTool(
     }
     if (mcp_execution_error) |err| {
         dispatched.deinit(arena);
+        if (err == error.McpAdvertisedToolChanged) return refreshChangedMcpTool(ctx, arena, call.name);
         return err;
     }
 
@@ -835,8 +845,7 @@ fn executeRegisteredTool(
         execution.finish_turn = true;
         execution.status_detail = "McpInputRequired";
     }
-    execution.selected_dynamic_tool_name = selected_dynamic_tool_sink.name;
-    execution.selected_dynamic_tool_schema_json = selected_dynamic_tool_sink.schema_json;
+    execution.selected_dynamic_tools = selected_dynamic_tool_sink.tools.items;
     execution.context_notices = context_notice_sink.notices.items;
     execution.result_commit = result_commit_token;
     if (dispatch_ctx.cancel_flag) |cancel_flag| {
@@ -889,6 +898,7 @@ fn executeRunCommandBackend(
 }
 
 const DispatchMetadata = struct {
+    model_content_kind: tool_dispatch.ModelContentKind = .ordinary,
     status_detail: ?[]u8 = null,
     inner_usage: ?types.ToolUsage = null,
     web_search_completion: ?types.WebSearchCompletion = null,
@@ -898,6 +908,7 @@ const DispatchMetadata = struct {
     turn_control: ?tool_dispatch.TurnControl = null,
 
     fn attach(self: *DispatchMetadata, ctx: *tool_dispatch.DispatchContext) void {
+        ctx.model_content_kind_sink = &self.model_content_kind;
         ctx.inner_usage_sink = &self.inner_usage;
         ctx.web_search_completion_sink = &self.web_search_completion;
         ctx.web_fetch_completion_sink = &self.web_fetch_completion;
@@ -911,14 +922,21 @@ fn toolExecutionResultFromDispatch(
     result: tool_dispatch.AuthorizedDispatchResult,
     metadata: DispatchMetadata,
 ) ToolExecutionResult {
+    var memory = metadata.tool_result_memory;
+    if (result.images.len > 0) {
+        var rich_memory = memory orelse types.ToolResultMemory{};
+        rich_memory.tool_images = result.images;
+        memory = rich_memory;
+    }
     return switch (result.status) {
         .success => .{
+            .model_content_kind = metadata.model_content_kind,
             .model_output = result.body,
             .status_detail = metadata.status_detail,
             .inner_usage = metadata.inner_usage,
             .web_search_completion = metadata.web_search_completion,
             .web_fetch_completion = metadata.web_fetch_completion,
-            .tool_result_memory = metadata.tool_result_memory,
+            .tool_result_memory = memory,
             .command_result_json = metadata.command_result_json,
             .turn_control = metadata.turn_control,
         },
@@ -929,17 +947,65 @@ fn toolExecutionResultFromDispatch(
             .inner_usage = metadata.inner_usage,
             .web_search_completion = metadata.web_search_completion,
             .web_fetch_completion = metadata.web_fetch_completion,
-            .tool_result_memory = metadata.tool_result_memory,
+            .tool_result_memory = memory,
             .command_result_json = metadata.command_result_json,
             .turn_control = metadata.turn_control,
         },
     };
 }
 
+pub fn snapshotMcpDefinition(ctx: Context, arena: Allocator, name: []const u8, known: tool_mcp_runtime.Binding) !tool_mcp_runtime.DefinitionSnapshot {
+    const runtime = ctx.mcp_ctx orelse return .unavailable;
+    const snapshot = ctx.mcp_snapshot_tool orelse return .unavailable;
+    return snapshot(runtime, arena, name, known, ctx.permission_rules, ctx.context_limits, ctx.mcp_access);
+}
+
+fn refreshChangedMcpTool(ctx: Context, arena: Allocator, name: []const u8) !ToolExecutionResult {
+    var unavailable_output: []const u8 = "MCP tool definition changed before execution and is no longer available. Search for current tools.";
+    var notice: ?[]const u8 = null;
+    if (ctx.mcp_ctx) |runtime_context| if (ctx.mcp_tool_schema) |schema_fn| {
+        const current = schema_fn(runtime_context, arena, name, ctx.permission_rules, ctx.context_limits, ctx.mcp_access, runtimeCancelFlag(ctx)) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => null,
+        };
+        if (current) |projection| switch (projection) {
+            .selected => |payload| {
+                const selected = try arena.alloc(tool_mcp_runtime.SelectedTool, 1);
+                selected[0] = .{ .name = name, .schema_json = payload.model_output, .mcp_binding = payload.mcp_binding };
+                return .{
+                    .status = .failure,
+                    .model_output = "MCP tool definition changed before execution. Its current schema is loaded; review it before issuing a new call.",
+                    .selected_dynamic_tools = selected,
+                    .context_notices = if (payload.notice) |value| notices: {
+                        const values = try arena.alloc([]const u8, 1);
+                        values[0] = value;
+                        break :notices values;
+                    } else &.{},
+                };
+            },
+            .rejected => |payload| {
+                unavailable_output = payload.model_output;
+                notice = payload.notice;
+            },
+        };
+    };
+    const retired = try arena.alloc([]const u8, 1);
+    retired[0] = name;
+    return .{
+        .status = .failure,
+        .model_output = unavailable_output,
+        .retired_dynamic_tool_names = retired,
+        .context_notices = if (notice) |value| notices: {
+            const values = try arena.alloc([]const u8, 1);
+            values[0] = value;
+            break :notices values;
+        } else &.{},
+    };
+}
+
 const SelectedDynamicToolSinkState = struct {
     allocator: Allocator,
-    name: ?[]const u8 = null,
-    schema_json: ?[]const u8 = null,
+    tools: std.ArrayList(tool_mcp_runtime.SelectedTool) = .empty,
 };
 
 const ContextNoticeSinkState = struct {
@@ -972,14 +1038,15 @@ fn recordSelectedDynamicToolForDispatch(
     raw_ctx: ?*anyopaque,
     name: []const u8,
     schema_json: []const u8,
+    binding: ?tool_mcp_runtime.Binding,
 ) error{OutOfMemory}!void {
     const state_ptr = raw_ctx orelse return;
     const state: *SelectedDynamicToolSinkState = @ptrCast(@alignCast(state_ptr));
     const owned_name = try state.allocator.dupe(u8, name);
     errdefer state.allocator.free(owned_name);
     const owned_schema_json = try state.allocator.dupe(u8, schema_json);
-    state.name = owned_name;
-    state.schema_json = owned_schema_json;
+    errdefer state.allocator.free(owned_schema_json);
+    try state.tools.append(state.allocator, .{ .name = owned_name, .schema_json = owned_schema_json, .mcp_binding = binding });
 }
 
 fn typedDispatchContext(ctx: Context, arena: Allocator) tool_dispatch.DispatchContext {
@@ -995,6 +1062,7 @@ fn typedDispatchContext(ctx: Context, arena: Allocator) tool_dispatch.DispatchCo
         .access_scope = ctx.access_scope,
         .change_tracker = ctx.tracker,
         .skills_dir = ctx.skills_dir,
+        .skill_locations = ctx.skill_locations,
         .context_limits = ctx.context_limits,
         .ignored_list_entries = ctx.ignored_list_entries,
         .max_list_entries = ctx.max_list_entries,
@@ -1111,7 +1179,16 @@ fn typedDispatchContextForCall(
     var dispatch = typedDispatchContext(ctx, arena);
     dispatch.tool_call_id = call.id;
     dispatch.tool_call_name = call.name;
+    dispatch.resolved_skill = call.resolved_skill;
     return dispatch;
+}
+
+pub fn prepareSkillCall(ctx: Context, arena: Allocator, call: ToolCall, locations: ?*const skill_contract.Locations) !skill_contract.CallPreparation {
+    const tool = ctx.tool_registry.lookup(call.name) orelse return error.UnsupportedTool;
+    const prepare = tool.prepare_skill_call_fn orelse return error.UnsupportedTool;
+    var dispatch = typedDispatchContextForCall(ctx, arena, call);
+    dispatch.skill_locations = locations;
+    return prepare(dispatch, call.arguments_json);
 }
 
 const VisionProviderState = struct {
@@ -1309,7 +1386,6 @@ fn mcpRuntimeCapabilities(ctx: Context) tool_mcp_runtime.RuntimeCapabilities {
         .has_tool = ctx.mcp_has_tool,
         .validate_tool = ctx.mcp_validate_tool,
         .call_tool = ctx.mcp_call_tool,
-        .tool_schema = ctx.mcp_tool_schema,
         .access = ctx.mcp_access,
     };
 }
@@ -1447,6 +1523,10 @@ fn toolRunCommand(
         const output = switch (compatibility) {
             .success => |body| body,
             .failure => |body| body,
+            .rich => {
+                compatibility.deinit(arena);
+                return error.RichCommandOutputUnsupported;
+            },
         };
         if (compatibility == .success and capture != null and output.len > 0) {
             callback.accept(
@@ -1484,6 +1564,7 @@ fn toolRunCommand(
                 .status = switch (compatibility) {
                     .success => .success,
                     .failure => .failure,
+                    .rich => unreachable,
                 },
                 .model_output = output,
             },
@@ -2155,9 +2236,6 @@ fn testReviewTurn() permission_auto_classifier.ReviewTurnContext {
 
 const TestRuntime = struct {
     agent_stream_provider: agent_stream_provider.Provider = agent_stream_provider.unavailable_provider,
-    compaction_route: provider_set.CompactionRouteDecision = .{
-        .ready = .{ .provider = .gateway, .model = "openai/gpt-5.6-luna" },
-    },
     tool_registry: tool_dispatch.Registry = test_tool_registry,
     worker: WorkerRuntime = .{},
     session: SessionRuntime = .{ .max_history_turns = 8 },
@@ -2197,6 +2275,7 @@ const TestRuntime = struct {
     mcp_call_tool: ?tool_mcp_runtime.CallToolFn = null,
     mcp_search_tools: ?tool_mcp_runtime.SearchToolsFn = null,
     mcp_tool_schema: ?tool_mcp_runtime.ToolSchemaFn = null,
+    mcp_snapshot_tool: ?tool_mcp_runtime.SnapshotToolFn = null,
     mcp_call_feature: ?tool_mcp_runtime.FeatureCallFn = null,
     mcp_input_responder: ?tool_mcp_runtime.InputResponder = null,
     advertised_dynamic_tool_names: []const []const u8 = &.{},
@@ -2230,7 +2309,6 @@ const TestRuntime = struct {
             .max_tool_result_bytes = self.max_tool_result_bytes,
             .api_key = self.api_key,
             .agent_stream_provider = self.agent_stream_provider,
-            .compaction_route = self.compaction_route,
             .gateway_team = self.gateway_team,
             .provider = self.provider,
             .provider_capabilities = self.provider_capabilities,
@@ -2269,6 +2347,7 @@ const TestRuntime = struct {
             .mcp_call_tool = self.mcp_call_tool,
             .mcp_search_tools = self.mcp_search_tools,
             .mcp_tool_schema = self.mcp_tool_schema,
+            .mcp_snapshot_tool = self.mcp_snapshot_tool,
             .mcp_call_feature = self.mcp_call_feature,
             .mcp_input_responder = self.mcp_input_responder,
             .advertised_dynamic_tool_names = self.advertised_dynamic_tool_names,
@@ -5025,6 +5104,7 @@ test "no-save terminal exec publishes one readable ephemeral replay" {
     const read_result = try read_tool_result.call(read_ctx, read_input);
     defer read_result.deinit(arena);
     switch (read_result) {
+        .rich => return error.TestUnexpectedRichResult,
         .success => |page| try expectContains(page, "ephemeral-needle"),
         .failure => return error.TestExpectedReplay,
     }
@@ -5818,8 +5898,9 @@ test "shell run rejects legacy background input without creating state" {
     });
 
     try std.testing.expectEqual(tool_contracts.ToolExecutionStatus.failure, result.status);
-    try expectContains(result.model_output, "\"code\":\"invalid_action_fields\"");
-    try expectContains(result.model_output, "\"invalid_fields\":[\"background\"]");
+    try expectContains(result.model_output, "\"code\":\"invalid_shell_request\"");
+    try expectContains(result.model_output, "request.background is not accepted for run.");
+    try std.testing.expect(std.mem.find(u8, result.model_output, "retry_with") == null);
 }
 
 const PermissionThreadState = struct {
@@ -6091,21 +6172,21 @@ const McpFixture = struct {
         return .{ .model_output = try std.fmt.allocPrint(arena, "{{\"query\":\"{s}\",\"tools\":[{{\"name\":\"mcp_fs_read\",\"server\":\"fs\",\"description\":\"Read\",\"input_schema\":{{\"type\":\"object\"}},\"tags\":[\"fs\",\"read\"]}}],\"count\":1}}", .{request.query.raw}) };
     }
 
-    fn schema(_: *anyopaque, arena: Allocator, name: []const u8, _: types.PermissionRuleSet, _: context_limits.Values, _: tool_mcp_runtime.Access) anyerror!?tool_mcp_runtime.ToolSchemaResult {
+    fn schema(_: *anyopaque, arena: Allocator, name: []const u8, _: types.PermissionRuleSet, _: context_limits.Values, _: tool_mcp_runtime.Access, _: ?*std.atomic.Value(bool)) anyerror!?tool_mcp_runtime.ToolSchemaResult {
         if (!std.mem.eql(u8, name, "mcp_fs_read")) return null;
         return .{ .selected = .{ .model_output = try arena.dupe(u8, "{\"type\":\"function\",\"name\":\"mcp_fs_read\",\"description\":\"Read <context_limit action='literal' />\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"context_limit_rejection\":{\"type\":\"string\"}}}}") } };
     }
 
-    fn searchRecordingRules(raw_ctx: *anyopaque, arena: Allocator, request: capability_retrieval.Request, permission_rules: types.PermissionRuleSet, limits: context_limits.Values, _: tool_mcp_runtime.Access) anyerror!tool_mcp_runtime.SearchResult {
+    fn searchRecordingRules(raw_ctx: *anyopaque, arena: Allocator, request: capability_retrieval.Request, permission_rules: types.PermissionRuleSet, limits: context_limits.Values, _: tool_mcp_runtime.Access, _: ?*std.atomic.Value(bool)) anyerror!tool_mcp_runtime.SearchResult {
         const ctx: *PermissionContext = @ptrCast(@alignCast(raw_ctx));
         ctx.search_rule_count = permission_rules.rules.len;
         return search(raw_ctx, arena, request, permission_rules, limits);
     }
 
-    fn schemaRecordingRules(raw_ctx: *anyopaque, arena: Allocator, name: []const u8, permission_rules: types.PermissionRuleSet, limits: context_limits.Values, access: tool_mcp_runtime.Access) anyerror!?tool_mcp_runtime.ToolSchemaResult {
+    fn schemaRecordingRules(raw_ctx: *anyopaque, arena: Allocator, name: []const u8, permission_rules: types.PermissionRuleSet, limits: context_limits.Values, access: tool_mcp_runtime.Access, cancel_flag: ?*std.atomic.Value(bool)) anyerror!?tool_mcp_runtime.ToolSchemaResult {
         const ctx: *PermissionContext = @ptrCast(@alignCast(raw_ctx));
         ctx.schema_rule_count = permission_rules.rules.len;
-        return schema(raw_ctx, arena, name, permission_rules, limits, access);
+        return schema(raw_ctx, arena, name, permission_rules, limits, access, cancel_flag);
     }
 };
 
@@ -6200,9 +6281,9 @@ test "MCP select does not authorize same-response dynamic execution" {
         .arguments_json = "{\"name\":\"mcp_fs_read\"}",
     });
     try std.testing.expectEqual(tool_contracts.ToolExecutionStatus.success, selected.status);
-    try std.testing.expectEqualStrings("mcp_fs_read", selected.selected_dynamic_tool_name.?);
-    try expectContains(selected.selected_dynamic_tool_schema_json.?, "context_limit_rejection");
-    try expectContains(selected.selected_dynamic_tool_schema_json.?, "<context_limit action='literal' />");
+    try std.testing.expectEqualStrings("mcp_fs_read", selected.selected_dynamic_tools[0].name);
+    try expectContains(selected.selected_dynamic_tools[0].schema_json, "context_limit_rejection");
+    try expectContains(selected.selected_dynamic_tools[0].schema_json, "<context_limit action='literal' />");
 
     const result = try executeToolCall(rt.context(), arena, .{
         .id = "dynamic",
@@ -6479,14 +6560,22 @@ test "skill tool preserves resource and discovery notices separately" {
     defer arena_state.deinit();
     var ctx = rt.context();
     ctx.context_limits.skill_chunk_bytes = .{ .value = .{ .bytes = 96 }, .source = .command_line };
-    const result = try executeToolCall(ctx, arena_state.allocator(), .{ .id = "1", .name = "skill", .arguments_json = "{\"name\":\"workflow\"}" });
-    try expectContains(result.model_output, "<skill_content name=\"workflow\" resource=\"SKILL.md\" offset=\"0\"");
-    try expectContains(result.model_output, "use the workflow skill");
-    try expectNotContains(result.model_output, "assets/data.txt");
-    try std.testing.expect(result.system_notice == null);
-    try std.testing.expectEqual(@as(usize, 2), result.context_notices.len);
-    try expectContains(result.context_notices[0], "[context] skill resource \"workflow/SKILL.md\" truncated");
-    try expectContains(result.context_notices[1], "skill discovery warning:");
+    const call: ToolCall = .{ .id = "1", .name = "skill", .arguments_json = "{\"name\":\"workflow\"}" };
+    const preparation = try prepareSkillCall(ctx, arena_state.allocator(), call, null);
+    defer @import("../skills/skill_invocation.zig").freeCallPreparation(arena_state.allocator(), preparation);
+    const selected = preparation.selected;
+    for ([_]bool{ false, true }) |bound| {
+        var effective_call = call;
+        if (bound) effective_call.resolved_skill = &selected;
+        const result = try executeToolCall(ctx, arena_state.allocator(), effective_call);
+        try expectContains(result.model_output, "<skill_content name=\"workflow\" resource=\"SKILL.md\" offset=\"0\"");
+        try expectContains(result.model_output, "use the workflow skill");
+        try expectNotContains(result.model_output, "assets/data.txt");
+        try std.testing.expect(result.system_notice == null);
+        try std.testing.expectEqual(@as(usize, 2), result.context_notices.len);
+        try expectContains(result.context_notices[0], "[context] skill resource \"workflow/SKILL.md\" truncated");
+        try expectContains(result.context_notices[1], "skill discovery warning:");
+    }
 }
 
 test "skill tool loads the exact advertised duplicate and rejects ambiguous or untrusted locations" {

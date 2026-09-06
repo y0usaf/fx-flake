@@ -11,7 +11,6 @@ const provider_catalog = @import("../core/auth/provider_catalog.zig");
 pub const native = provider_set.Set{
     .gateway = gateway.provider_bundle,
     .codex = .{
-        .compaction_model = "gpt-5.6-luna",
         .presentation = provider_catalog.find(.codex),
         .auth_strategy = .chatgpt,
         .agent_stream = openai_codex.agent_stream_provider,
@@ -20,7 +19,6 @@ pub const native = provider_set.Set{
         .permission_reviewer = openai_codex_permission_reviewer.provider,
     },
     .grok = .{
-        .compaction_model = "grok-4.5",
         .presentation = provider_catalog.find(.grok),
         .auth_strategy = .grok,
         .agent_stream = xai_grok.agent_stream_provider,

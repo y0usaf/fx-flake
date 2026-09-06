@@ -242,7 +242,8 @@ test.skipIf(!tmuxAvailable())(
     expect(interactResult).toContain("CAPTURED_DONE");
     const scrollback = await active.captureFullScrollback();
     expect(scrollback).toContain("Ran sleep 2; printf CAPTURED_DONE");
-    expect(scrollback).toContain(`Observed session ${sessionId}`);
+    expect(scrollback).toContain("Observed sleep 2; printf CAPTURED_DONE");
+    expect(scrollback).not.toContain(`Observed session ${sessionId}`);
     expect(scrollback).not.toContain("Using terminal");
     expect(scrollback).not.toContain("Used terminal");
     expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
@@ -295,6 +296,9 @@ test.skipIf(!tmuxAvailable())(
     await active.sendText("Stop the exact retained command now.");
     await active.sendKeys("Enter");
     await active.waitForText("PHASE_TWO_READY", TIMEOUT);
+    const scrollback = await active.captureFullScrollback();
+    expect(scrollback).toContain("Stopped printf HANDOFF_READY; sleep 30");
+    expect(scrollback).not.toContain(`Stopped session ${sessionId}`);
     expect(toolResultEnvelope(
       gateway.requests[3]!.body,
       "shell_cross_turn_stop",

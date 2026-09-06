@@ -772,10 +772,7 @@ pub fn ensureStateLayout(paths: Paths) !void {
 }
 
 pub fn parsePermissionMode(raw: []const u8) ?types.PermissionMode {
-    if (std.ascii.eqlIgnoreCase(raw, "ask")) return .ask;
-    if (std.ascii.eqlIgnoreCase(raw, "auto")) return .auto;
-    if (std.ascii.eqlIgnoreCase(raw, "yolo")) return .yolo;
-    return null;
+    return types.PermissionMode.parse(raw);
 }
 
 pub fn parsePermissionAction(raw: []const u8) ?types.PermissionAction {
@@ -2454,6 +2451,11 @@ test "parsePermissionMode accepts only exact case-insensitive labels" {
     try std.testing.expectEqual(types.PermissionMode.auto, parsePermissionMode("Auto").?);
     try std.testing.expectEqual(types.PermissionMode.yolo, parsePermissionMode("yolo").?);
     try std.testing.expectEqual(types.PermissionMode.yolo, parsePermissionMode("YOLO").?);
+    try std.testing.expectEqual(types.PermissionMode.yolo, parsePermissionMode("full-access").?);
+    try std.testing.expectEqual(types.PermissionMode.yolo, parsePermissionMode("Full Access").?);
+    try std.testing.expect(parsePermissionMode("full") == null);
+    try std.testing.expect(parsePermissionMode(" full-access") == null);
+    try std.testing.expect(parsePermissionMode("full-access ") == null);
     try std.testing.expect(parsePermissionMode(" default") == null);
     try std.testing.expect(parsePermissionMode("danger") == null);
 }

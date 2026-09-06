@@ -674,7 +674,7 @@ describe.skipIf(SKIP)("tui: render lab", () => {
 
       expect(output).toContain("same-shell-relaunch");
       expect(output).toContain("run-");
-      expect(FX_BIN).toContain("zig-out/bin/fx");
+      expect(FX_BIN).toContain("zig-out/bin/omfx");
       const runDir = output.trim().split(/\s+/).at(-1)!;
       const manifest = JSON.parse(readFileSync(join(runDir, "manifest.json"), "utf8"));
       const replay = JSON.parse(readFileSync(join(runDir, "replay-summary.json"), "utf8"));

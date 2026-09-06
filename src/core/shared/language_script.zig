@@ -51,6 +51,13 @@ pub fn profile_non_latin_prose(text: []const u8) Profile {
     return profile_with_filter(text, true, false);
 }
 
+pub fn profile_prose_pair(text: []const u8) struct { all: Profile, non_latin: Profile } {
+    var counts = count_text(text, true);
+    const all = summarize(counts);
+    counts.latin = 0;
+    return .{ .all = all, .non_latin = summarize(counts) };
+}
+
 const Quote = enum {
     none,
     double,
@@ -59,6 +66,12 @@ const Quote = enum {
 };
 
 fn profile_with_filter(text: []const u8, prose_only: bool, include_latin: bool) Profile {
+    var counts = count_text(text, prose_only);
+    if (!include_latin) counts.latin = 0;
+    return summarize(counts);
+}
+
+fn count_text(text: []const u8, prose_only: bool) Counts {
     var counts: Counts = .{};
     var index: usize = 0;
     var in_code = false;
@@ -122,12 +135,13 @@ fn profile_with_filter(text: []const u8, prose_only: bool, include_latin: bool) 
                 continue;
             }
         }
-        if (include_latin or !is_latin_codepoint(codepoint)) {
-            classify_codepoint(&counts, codepoint);
-        }
+        classify_codepoint(&counts, codepoint);
         index += width;
     }
+    return counts;
+}
 
+fn summarize(counts: Counts) Profile {
     const letters = counts.total();
     if (counts.hiragana + counts.katakana > 0) return .{
         .script = .japanese,
@@ -264,6 +278,26 @@ fn is_han_codepoint(codepoint: u21) bool {
         (codepoint >= 0x2A700 and codepoint <= 0x2B73F) or
         (codepoint >= 0x2B740 and codepoint <= 0x2B81F) or
         (codepoint >= 0x2B820 and codepoint <= 0x2CEAF);
+}
+
+test "paired prose profiles preserve both existing language views" {
+    const samples = [_][]const u8{
+        "",
+        "English response with sparse 界 markers.",
+        "次にロックファイルを確認します。 English identifiers.",
+        "Сначала проверим файл. Then inspect it.",
+        "한국어 응답 and English text.",
+        "English `日本語 code` (quoted 中文) \"Русский\" prose.",
+        "English “中文” {日本語 [nested]} prose.",
+        "\xff invalid \xe3\x81",
+    };
+    for (samples) |text| {
+        const pair = profile_prose_pair(text);
+        try std.testing.expectEqual(profile_prose(text), pair.all);
+        try std.testing.expectEqual(profile_non_latin_prose(text), pair.non_latin);
+    }
+    try std.testing.expectEqual(Profile{ .script = .latin, .letters = 5, .dominant_letters = 3 }, profile_prose_pair("abc中文").all);
+    try std.testing.expectEqual(Profile{ .script = .han, .letters = 2, .dominant_letters = 2 }, profile_prose_pair("abc中文").non_latin);
 }
 
 test "language script profile preserves session inference semantics" {

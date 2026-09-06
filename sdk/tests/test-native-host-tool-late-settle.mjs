@@ -57,7 +57,11 @@ async function exerciseLateSettlement(closeBeforeSettle) {
     agent = await createFxAgent({
       backend: "native",
       nativeAddon: resolve(scriptDir, "../../zig-out/lib/libfx.node"),
-      fetch,
+      fetch(input, init) {
+        const url = init.method === "GET" ? `http://127.0.0.1:${server.address().port}/models` : input;
+        assert.equal(new URL(url).origin, `http://127.0.0.1:${server.address().port}`);
+        return fetch(url, init);
+      },
       onEvent(event) { events.push(event); },
       tools: [{
         name: "late",

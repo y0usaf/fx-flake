@@ -227,7 +227,7 @@ export const AGENT_QUALITY_BASELINE_MATRIX: readonly AgentQualityMatrixRow[] = [
     currentBaselineResult: {
       status: "partial",
       notes:
-        "Live ./zig-out/bin/fx ask --auto --json --no-save answered from existing context with zero tool calls. First tool: none; forbidden tools: none; behavior cited src/core/slash_commands/command_specs.zig but did not perform local discovery first.",
+        "Live ./zig-out/bin/omfx ask --auto --json --no-save answered from existing context with zero tool calls. First tool: none; forbidden tools: none; behavior cited src/core/slash_commands/command_specs.zig but did not perform local discovery first.",
     },
     targetResult:
       "Starts with local discovery and identifies src/core/slash_commands/command_specs.zig from local evidence.",
@@ -258,7 +258,7 @@ export const AGENT_QUALITY_BASELINE_MATRIX: readonly AgentQualityMatrixRow[] = [
     currentBaselineResult: {
       status: "passing",
       notes:
-        "Live ./zig-out/bin/fx ask --auto --json --no-save used grep_files first and made five grep_files calls total. Forbidden tools: none; behavior reported concrete local matches in command_policy.zig, tool_permission.zig, and terminal.zig.",
+        "Live ./zig-out/bin/omfx ask --auto --json --no-save used grep_files first and made five grep_files calls total. Forbidden tools: none; behavior reported concrete local matches in command_policy.zig, tool_permission.zig, and terminal.zig.",
     },
     targetResult: "Uses local search tools only and reports concrete local matches.",
     coveredEntrypoints: [
@@ -325,7 +325,7 @@ export const AGENT_QUALITY_BASELINE_MATRIX: readonly AgentQualityMatrixRow[] = [
     currentBaselineResult: {
       status: "passing",
       notes:
-        "Live ./zig-out/bin/fx ask --auto --json --no-save used read_file first, then a second read_file. Forbidden tools: none; behavior inspected MCP runtime/docs before answering and did not ask the user.",
+        "Live ./zig-out/bin/omfx ask --auto --json --no-save used read_file first, then a second read_file. Forbidden tools: none; behavior inspected MCP runtime/docs before answering and did not ask the user.",
     },
     targetResult: "At least one local inspection happens before any user question.",
     coveredEntrypoints: [
@@ -502,7 +502,7 @@ export const AGENT_QUALITY_BASELINE_MATRIX: readonly AgentQualityMatrixRow[] = [
     currentBaselineResult: {
       status: "passing",
       notes:
-        "Live ./zig-out/bin/fx ask --auto --json --no-save used shell.run first with gh pr view 57 --repo vercel-labs/fx --comments. Forbidden tools: none; behavior summarized PR review comments and bot deploy comments from gh output.",
+        "Live ./zig-out/bin/omfx ask --auto --json --no-save used shell.run first with gh pr view 57 --repo vercel-labs/fx --comments. Forbidden tools: none; behavior summarized PR review comments and bot deploy comments from gh output.",
     },
     targetResult: "Routes known GitHub PR comments to gh and reports an actionable blocker if gh cannot run.",
     coveredEntrypoints: [

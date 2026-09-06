@@ -91,6 +91,10 @@ pub fn Runtime(comptime App: type) type {
                 error.ConnectionSetupTimedOut => return alloc.dupe(u8, "Connection setup timed out after 30 seconds."),
                 error.TlsInitializationFailed => return alloc.dupe(u8, "Connection setup failed: TLS could not be initialized."),
                 error.ModelImageCapabilityUnavailable => return alloc.dupe(u8, image_attachments.model_image_capability_unavailable_notice),
+                error.InvalidCompactionHandoff => return alloc.dupe(
+                    u8,
+                    "The model did not return a usable context summary. Your existing context was kept. Try /compact again or send a follow-up.",
+                ),
                 error.CompactionResultStorageUnavailable => return alloc.dupe(
                     u8,
                     "Context could not be compacted because older tool results could not be preserved. Save the session or restore writable session storage, then try again.",
@@ -214,6 +218,15 @@ test "formatErrorBody describes terminal connection setup failures plainly" {
     const unrelated_timeout = try Rt.formatErrorBody(alloc, "request failed", error.ConnectionTimedOut);
     defer alloc.free(unrelated_timeout);
     try std.testing.expectEqualStrings("request failed: ConnectionTimedOut", unrelated_timeout);
+}
+
+test "formatErrorBody explains how to retry an unusable compaction summary" {
+    const alloc = std.testing.allocator;
+    const body = try Runtime(DummyApp).formatErrorBody(alloc, "request failed", error.InvalidCompactionHandoff);
+    defer alloc.free(body);
+    try std.testing.expect(std.mem.find(u8, body, "context was kept") != null);
+    try std.testing.expect(std.mem.find(u8, body, "/compact") != null);
+    try std.testing.expect(std.mem.find(u8, body, "follow-up") != null);
 }
 
 test "formatErrorBody explains compaction result storage failure" {

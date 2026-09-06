@@ -16,6 +16,7 @@ import {
   isVolatileTokenStatusRow,
   paneExitMatches,
   parseSingleChildPid,
+  terminalFixtureShell,
   TmuxSession,
   tmuxAvailable,
 } from "./tmux-helpers";
@@ -48,6 +49,12 @@ test("launched process PID parsing requires one direct child", () => {
   expect(() => parseSingleChildPid("not-a-pid\n", 27182)).toThrow(
     "invalid child PID",
   );
+});
+
+test("terminal fixture shell resolves an executable absolute path", () => {
+  const shell = terminalFixtureShell();
+  expect(shell.startsWith("/")).toBe(true);
+  expect(existsSync(shell)).toBe(true);
 });
 
 test("held gateway response disposes before it is requested", async () => {

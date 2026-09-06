@@ -60,7 +60,7 @@ fn entryHiddenByActions(
 
 /// Nominate the entries whose rendered start bytes bound the final flow
 /// prefix: the first entry carrying a live mutation pin, the first rendered
-/// entry of each tool turn, and a trailing assistant entry. Omitted and
+/// entry of each live tool turn, and a trailing assistant entry. Omitted and
 /// hidden entries contribute no flow bytes and are skipped.
 fn collectFinalityNominations(
     self: anytype,
@@ -86,6 +86,7 @@ fn collectFinalityNominations(
     var group_terminality: std.AutoHashMapUnmanaged(types.ToolPresentationGroupId, bool) = .empty;
     defer group_terminality.deinit(alloc);
     for (self.tool_details.items) |detail| {
+        if (detail.origin == .recorded) continue;
         const group = detail.presentation_group_id orelse continue;
         const result = try group_terminality.getOrPut(alloc, group);
         if (!result.found_existing) result.value_ptr.* = true;
@@ -95,6 +96,7 @@ fn collectFinalityNominations(
     var entry_tool_identities: std.AutoHashMapUnmanaged(u32, ToolFinalityIdentity) = .empty;
     defer entry_tool_identities.deinit(alloc);
     for (self.tool_details.items) |detail| {
+        if (detail.origin == .recorded) continue;
         const identity: ToolFinalityIdentity = if (detail.presentation_group_id) |group|
             .{
                 .turn_id = group.turn_id,

@@ -7,7 +7,7 @@ import { createFxTerminal, supportsJspi, xtermAdapter } from "../node.js";
 
 const { Terminal } = xtermHeadless;
 const scriptDir = fileURLToPath(new URL(".", import.meta.url));
-const wasmPath = resolve(process.argv[2] || resolve(scriptDir, "../../zig-out/bin/fx-term.wasm"));
+const wasmPath = resolve(process.argv[2] || resolve(scriptDir, "../../zig-out/bin/omfx-term.wasm"));
 if (!supportsJspi()) process.exit(2);
 const wasm = await readFile(wasmPath);
 const histories = new Map();
@@ -24,9 +24,9 @@ const promptHistoryStore = {
 const encoded = new TextEncoder();
 const fetch = async () => new Response(new ReadableStream({
   start(controller) {
-    controller.enqueue(encoded.encode('data: {"type":"text-delta","delta":"ok"}\n'));
-    controller.enqueue(encoded.encode('data: {"type":"finish","finishReason":{"unified":"stop"}}\n'));
-    controller.enqueue(encoded.encode("data: [DONE]\n"));
+    controller.enqueue(encoded.encode('data: {"type":"text-delta","delta":"ok"}\n\n'));
+    controller.enqueue(encoded.encode('data: {"type":"finish","finishReason":{"unified":"stop"}}\n\n'));
+    controller.enqueue(encoded.encode("data: [DONE]\n\n"));
     controller.close();
   },
 }), { status: 200, headers: { "content-type": "text/event-stream" } });

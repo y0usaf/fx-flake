@@ -528,7 +528,7 @@ pub const StatusSnapshot = struct {
         if (self.auth.team) |team| {
             try out.writer.print("[status] team={s}\n", .{team});
         }
-        try out.writer.print("[status] permission_mode={s}\n", .{permissionModeLabel(self.permission_mode)});
+        try out.writer.print("[status] permission_mode={s}\n", .{permissions.permissionModeDisplayLabel(self.permission_mode)});
         try out.writer.print("[status] workspace={s}\n", .{self.workspace_root});
         try out.writer.print("[status] history_turns={d}\n", .{self.history_turns});
         try out.writer.print("[status] session_permission_grants={d}\n", .{self.session_permission_grants});
@@ -560,7 +560,7 @@ pub const StatusSnapshot = struct {
         if (self.auth.expired) try out.writer.writeAll("auth_expired=true\n");
         if (self.auth_help) |help| try out.writer.print("auth_help={s}\n", .{help});
         if (self.auth.team) |team| try out.writer.print("team={s}\n", .{team});
-        try out.writer.print("permission_mode={s}\n", .{permissionModeLabel(self.permission_mode)});
+        try out.writer.print("permission_mode={s}\n", .{permissions.permissionModeDisplayLabel(self.permission_mode)});
         try out.writer.print("workspace={s}\n", .{self.workspace_root});
         try out.writer.print("history_turns={d}\n", .{self.history_turns});
         try out.writer.print("session_permission_grants={d}\n", .{self.session_permission_grants});
@@ -670,7 +670,7 @@ pub const PermissionsSnapshot = struct {
         var out: std.Io.Writer.Allocating = .init(alloc);
         defer out.deinit();
 
-        try out.writer.print("[permissions] mode={s}\n", .{permissionModeLabel(self.mode)});
+        try out.writer.print("[permissions] mode={s}\n", .{permissions.permissionModeDisplayLabel(self.mode)});
         try writePermissionRulesText(&out.writer, self.rules);
         if (self.grants.len == 0) {
             try out.writer.writeAll("[permissions] session grants: (none)\n");
@@ -691,7 +691,7 @@ pub const PermissionsSnapshot = struct {
         var out: std.Io.Writer.Allocating = .init(alloc);
         defer out.deinit();
 
-        try out.writer.print("mode={s}\n", .{permissionModeLabel(self.mode)});
+        try out.writer.print("mode={s}\n", .{permissions.permissionModeDisplayLabel(self.mode)});
         if (self.rules.rules.len == 0) {
             try out.writer.writeAll("configured rules: (none)\n");
         } else {
@@ -1341,7 +1341,7 @@ pub const DoctorSnapshot = struct {
         if (self.auth.team) |team| {
             try out.writer.print("[doctor] team={s}\n", .{team});
         }
-        try out.writer.print("[doctor] permission_mode={s}\n", .{permissionModeLabel(self.permission_mode)});
+        try out.writer.print("[doctor] permission_mode={s}\n", .{permissions.permissionModeDisplayLabel(self.permission_mode)});
         try out.writer.print("[doctor] agent_step_limit={d}\n", .{self.agent_step_limit});
         if (self.mcp) |mcp| try mcp.writeText(&out.writer, alloc, "doctor");
 

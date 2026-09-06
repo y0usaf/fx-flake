@@ -3,6 +3,7 @@ from __future__ import annotations
 import dataclasses
 import os
 import pathlib
+import sys
 import tempfile
 import unittest
 
@@ -87,7 +88,7 @@ class PgsoPipelineTests(unittest.TestCase):
 
     def write_executable(self, name: str, body: str) -> pathlib.Path:
         path = self.root / name
-        path.write_text(f"#!/usr/bin/python3\n{body}\n")
+        path.write_text(f"#!{sys.executable}\n{body}\n")
         path.chmod(0o755)
         return path
 
@@ -202,7 +203,7 @@ class PgsoPipelineTests(unittest.TestCase):
         self.assertIn("-Doptimize=ReleaseSafe", control)
         self.assertIn("-Dupdate-channel=stable", control)
         self.assertIn("pgso-ir", ir)
-        self.assertIn("-Dpgso-artifact=fx", ir)
+        self.assertIn("-Dpgso-artifact=omfx", ir)
         self.assertNotEqual(
             control[control.index("--cache-dir") + 1],
             ir[ir.index("--cache-dir") + 1],
@@ -350,7 +351,7 @@ with pathlib.Path({str(actions)!r}).open('a') as stream:
         )
 
     def test_bitcode_hash_must_match_the_original(self) -> None:
-        bitcode = self.root / "fx.bc"
+        bitcode = self.root / "omfx.bc"
         bitcode.write_bytes(b"release-safe bitcode")
 
         validate_bitcode_hash(bitcode, sha256_file(bitcode))

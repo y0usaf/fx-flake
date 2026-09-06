@@ -5,7 +5,7 @@ import { fileURLToPath } from "node:url";
 import { createFxTerminal, supportsJspi } from "../node.js";
 
 const scriptDir = fileURLToPath(new URL(".", import.meta.url));
-const defaultWasm = resolve(scriptDir, "../../zig-out/bin/fx-term.wasm");
+const defaultWasm = resolve(scriptDir, "../../zig-out/bin/omfx-term.wasm");
 const wasmPath = resolve(process.argv[2] || defaultWasm);
 
 if (!supportsJspi()) {
@@ -43,6 +43,7 @@ const terminal = {
     if (steeringSubmittedAt !== undefined) postSubmitText += decoded;
     if (draftVisibleAt === undefined && streamedText.includes(liveDraft)) draftVisibleAt = performance.now();
     process.stdout.write(chunk);
+    return true;
   },
   async drain() {
     drainCalls += 1;
@@ -83,25 +84,25 @@ const mockFetch = async (_url, init) => {
     secondRequestBody = JSON.parse(new TextDecoder().decode(init.body));
     return new Response(new ReadableStream({
       start(controller) {
-        controller.enqueue(encoded.encode(`data: {"type":"text-delta","delta":"${steeringAnswer}"}\n`));
-        controller.enqueue(encoded.encode('data: {"type":"finish","finishReason":{"unified":"stop"},"usage":{"inputTokens":{"total":1},"outputTokens":{"total":2}}}\n'));
-        controller.enqueue(encoded.encode("data: [DONE]\n"));
+        controller.enqueue(encoded.encode(`data: {"type":"text-delta","delta":"${steeringAnswer}"}\n\n`));
+        controller.enqueue(encoded.encode('data: {"type":"finish","finishReason":{"unified":"stop"},"usage":{"inputTokens":{"total":1},"outputTokens":{"total":2}}}\n\n'));
+        controller.enqueue(encoded.encode("data: [DONE]\n\n"));
         controller.close();
       },
     }), { status: 200, headers: { "content-type": "text/event-stream" } });
   }
   return new Response(new ReadableStream({
     async start(controller) {
-      controller.enqueue(encoded.encode('data: {"type":"text-delta","delta":"hello"}\n'));
+      controller.enqueue(encoded.encode('data: {"type":"text-delta","delta":"hello"}\n\n'));
       streamStartedAt = performance.now();
       const interval = setInterval(() => {
-        controller.enqueue(encoded.encode('data: {"type":"text-delta","delta":"."}\n'));
+        controller.enqueue(encoded.encode('data: {"type":"text-delta","delta":"."}\n\n'));
       }, 20);
       await firstStreamRelease;
       clearInterval(interval);
-      controller.enqueue(encoded.encode('data: {"type":"text-delta","delta":" world"}\n'));
-      controller.enqueue(encoded.encode('data: {"type":"finish","finishReason":{"unified":"stop"},"usage":{"inputTokens":{"total":1},"outputTokens":{"total":2}}}\n'));
-      controller.enqueue(encoded.encode("data: [DONE]\n"));
+      controller.enqueue(encoded.encode('data: {"type":"text-delta","delta":" world"}\n\n'));
+      controller.enqueue(encoded.encode('data: {"type":"finish","finishReason":{"unified":"stop"},"usage":{"inputTokens":{"total":1},"outputTokens":{"total":2}}}\n\n'));
+      controller.enqueue(encoded.encode("data: [DONE]\n\n"));
       controller.close();
       streamFinishedAt = performance.now();
     },
@@ -180,7 +181,7 @@ if (!(streamStartedAt < secondRequestAt)) throw new Error("terminal started stee
 if (!(draftVisibleAt < steeringSubmittedAt)) throw new Error("terminal did not render the steering draft before submission");
 if (!(steeringSubmittedAt <= secondRequestAt)) throw new Error("terminal started steering before submission");
 if (!(secondRequestAt < streamFinishedAt)) throw new Error("terminal waited for the active response before steering");
-if (postSubmitText.includes(`${liveDraft} · Esc to steer now`)) throw new Error("terminal exposed tool-only pending UI during immediate steering");
+if (postSubmitText.includes(`┋ ${liveDraft}`)) throw new Error("terminal exposed tool-only pending UI during immediate steering");
 if (!postSubmitText.includes(liveDraft)) throw new Error("terminal did not commit the steering user row after cutoff");
 if (!postSubmitText.includes("Thinking")) throw new Error("terminal hid activity during immediate steering");
 const steeringUser = secondRequestBody.prompt?.filter((message) => message.role === "user").at(-1);

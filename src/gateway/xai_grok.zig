@@ -1,4 +1,5 @@
 const std = @import("std");
+const debug_trace = @import("../core/shared/debug_trace.zig");
 const image_attachments = @import("../core/images/image_attachments.zig");
 const grok_session = @import("../core/auth/grok_session.zig");
 const secret = @import("../core/auth/secret.zig");
@@ -7,12 +8,13 @@ const io_mod = @import("../core/shared/io.zig");
 const types = @import("../core/shared/types.zig");
 const gateway_client = @import("client.zig");
 const responses_protocol = @import("responses_protocol.zig");
+const sse_stream = @import("sse.zig");
 const model_tool_schema = @import("../core/tooling/model_tool_schema.zig");
 
 const Allocator = std.mem.Allocator;
 const endpoint = "https://cli-chat-proxy.grok.com/v1/responses";
 // The proxy gates this as Grok wire compatibility; fx identifies itself separately below.
-const proxy_compatibility_version = "1.0.6";
+const version_lookup = @import("provider_versions.zig");
 const e2e_endpoint_env = "FX_E2E_XAI_GROK_RESPONSES_URL";
 const max_error_body_bytes: usize = 256 * 1024;
 const max_sse_line_bytes: usize = 1024 * 1024;
@@ -28,6 +30,7 @@ const connect_timeout_ms: i64 = 30_000;
 pub const agent_stream_provider = stream_provider.Provider{
     .stream_fn = streamCompletion,
     .build_request_fn = buildRequestForProvider,
+    .project_replay_fn = responses_protocol.selectReplayParts,
 };
 
 fn validateModel(model: []const u8) !void {
@@ -41,17 +44,21 @@ pub fn buildRequest(
     alloc: Allocator,
     request: stream_provider.RequestData,
 ) ![]u8 {
+    try request.validatePrompt();
     try validateModel(request.model);
-    if (request.budget) |budget| {
-        if (budget.cancel_flag) |flag| if (flag.load(.seq_cst)) return error.Cancelled;
-        _ = budget.deadline;
-    }
+    const budget: image_attachments.CaptureBudget = if (request.budget) |value|
+        .{ .deadline = value.deadline, .cancel_flag = value.cancel_flag }
+    else
+        .{};
+    try budget.check();
+    const projected = try types.projectProviderReplay(alloc, request.messages, .{ .provider = .grok, .model = request.model });
+    defer if (projected) |messages| alloc.free(messages);
+    if (projected != null) debug_trace.logf("gateway", "provider_replay_omitted provider=grok reason=source_mismatch", .{});
 
     var instructions: std.Io.Writer.Allocating = .init(alloc);
     defer instructions.deinit();
-    for (request.messages) |message| {
-        if (message.role != .system) continue;
-        const text = message.content orelse continue;
+    for (request.instructions) |instruction| {
+        const text = instruction.content.?;
         if (text.len == 0) continue;
         if (instructions.written().len > 0) try instructions.writer.writeAll("\n\n");
         try instructions.writer.writeAll(text);
@@ -66,7 +73,7 @@ pub fn buildRequest(
     try writer.writeAll(",\"store\":false,\"stream\":true,\"instructions\":");
     try std.json.Stringify.value(instructions.written(), .{}, writer);
     try writer.writeAll(",\"input\":[");
-    try writeResponsesInput(writer, alloc, request.messages, request.verified_images);
+    try writeResponsesInput(writer, std.heap.c_allocator, projected orelse request.messages, request.verified_images, budget);
     try writer.writeByte(']');
 
     const tool_count = try responses_protocol.writeTools(writer, alloc, request.tools);
@@ -112,13 +119,14 @@ fn writeResponsesInput(
     alloc: Allocator,
     messages: []const types.ChatMessage,
     images: ?[]const image_attachments.VerifiedSnapshot,
+    budget: image_attachments.CaptureBudget,
 ) !void {
     return responses_protocol.writeInput(writer, alloc, messages, images, .{
         .tool_calls = max_tool_calls,
         .tool_identity_bytes = max_tool_identity_bytes,
         .tool_arguments_bytes = max_tool_arguments_bytes,
         .provider_state_bytes = max_provider_state_bytes,
-    }) catch |err| switch (err) {
+    }, budget) catch |err| switch (err) {
         error.ProviderStateTooLarge => error.XaiGrokProviderStateTooLarge,
         error.InvalidProviderState => error.InvalidXaiGrokProviderState,
         error.ToolCallLimitExceeded => error.XaiGrokToolCallLimitExceeded,
@@ -244,6 +252,10 @@ pub fn streamPrepared(
         break :endpoint override;
     } else endpoint;
     const uri = try std.Uri.parse(request_endpoint);
+    const compatibility = if (auth_headers.include_subscription_headers)
+        try version_lookup.resolve(alloc, .grok, request.cancel_flag, request.deadline)
+    else
+        null;
 
     var extra_headers_buf: [8]std.http.Header = undefined;
     var extra_count: usize = 0;
@@ -255,8 +267,10 @@ pub fn streamPrepared(
         extra_headers_buf[extra_count] = .{ .name = "x-authenticateresponse", .value = "authenticate-response" };
         extra_count += 1;
     }
-    extra_headers_buf[extra_count] = .{ .name = "x-grok-client-version", .value = proxy_compatibility_version };
-    extra_count += 1;
+    if (compatibility) |*version| {
+        extra_headers_buf[extra_count] = .{ .name = "x-grok-client-version", .value = version.slice() };
+        extra_count += 1;
+    }
     extra_headers_buf[extra_count] = .{ .name = "x-grok-client-identifier", .value = "fx" };
     extra_count += 1;
     extra_headers_buf[extra_count] = .{ .name = "x-grok-model-override", .value = request.model };
@@ -426,90 +440,9 @@ fn failureKind(status: std.http.Status) stream_provider.FailureKind {
     };
 }
 
-const SseReader = struct {
-    pending_line: std.ArrayList(u8) = .empty,
-    aggregate_bytes: usize = 0,
-
-    const Line = struct {
-        bytes: []const u8,
-        wire_bytes: usize,
-    };
-
-    fn deinit(self: *SseReader, alloc: Allocator) void {
-        self.pending_line.deinit(alloc);
-    }
-
-    fn release(self: *SseReader) void {
-        self.pending_line.clearRetainingCapacity();
-    }
-
-    fn next(self: *SseReader, alloc: Allocator, reader: anytype) !?[]const u8 {
-        while (true) {
-            const line = try self.readLine(alloc, reader) orelse return null;
-            self.aggregate_bytes = responses_protocol.checkedAccumulatedSize(
-                self.aggregate_bytes,
-                line.wire_bytes,
-                max_sse_aggregate_bytes,
-            ) catch return error.XaiGrokResourceLimitExceeded;
-            const trimmed = std.mem.trim(u8, line.bytes, " \t\r");
-            if (trimmed.len == 0 or trimmed[0] == ':') {
-                self.release();
-                continue;
-            }
-            if (!std.mem.startsWith(u8, trimmed, "data:")) {
-                self.release();
-                continue;
-            }
-            const data = std.mem.trim(u8, trimmed["data:".len..], " \t");
-            if (std.mem.eql(u8, data, "[DONE]")) return null;
-            return data;
-        }
-    }
-
-    fn readLine(self: *SseReader, alloc: Allocator, reader: anytype) !?Line {
-        while (true) {
-            const fragment = reader.takeDelimiter('\n') catch |err| switch (err) {
-                error.StreamTooLong => {
-                    const buffered = reader.buffered();
-                    if (buffered.len == 0) return error.XaiGrokSseReadStalled;
-                    if (buffered.len > max_sse_line_bytes - self.pending_line.items.len) {
-                        return error.XaiGrokSseEventTooLarge;
-                    }
-                    try self.pending_line.appendSlice(alloc, buffered);
-                    reader.tossBuffered();
-                    continue;
-                },
-                error.ReadFailed => return error.ReadFailed,
-            } orelse {
-                if (self.pending_line.items.len > 0) {
-                    return .{
-                        .bytes = self.pending_line.items,
-                        .wire_bytes = self.pending_line.items.len,
-                    };
-                }
-                return null;
-            };
-            if (fragment.len > max_sse_line_bytes - self.pending_line.items.len) {
-                return error.XaiGrokSseEventTooLarge;
-            }
-            if (self.pending_line.items.len == 0) {
-                return .{
-                    .bytes = fragment,
-                    .wire_bytes = fragment.len + 1,
-                };
-            }
-            try self.pending_line.appendSlice(alloc, fragment);
-            return .{
-                .bytes = self.pending_line.items,
-                .wire_bytes = self.pending_line.items.len + 1,
-            };
-        }
-    }
-};
-
 fn consumeSse(
     alloc: Allocator,
-    reader: anytype,
+    reader: *std.Io.Reader,
     callback_ctx: *anyopaque,
     on_content_chunk: stream_provider.StreamCallback,
     on_tool_start: ?stream_provider.ToolStartCallback,
@@ -520,7 +453,7 @@ fn consumeSse(
 ) !types.ModelCompletion {
     var reducer = responses_protocol.Reducer.init(alloc);
     defer reducer.deinit(alloc);
-    var sse: SseReader = .{};
+    var sse: sse_stream.Reader = .{ .max_event_bytes = max_sse_line_bytes, .max_total_bytes = max_sse_aggregate_bytes };
     defer sse.deinit(alloc);
     const callbacks = responses_protocol.StreamCallbacks{
         .context = callback_ctx,
@@ -538,8 +471,8 @@ fn consumeSse(
         .tool_arguments_bytes = max_tool_arguments_bytes,
         .provider_state_bytes = max_provider_state_bytes,
     };
-    while (try sse.next(alloc, reader)) |json_text| {
-        defer sse.release();
+    while (sse.next(alloc, reader, cancel_flag) catch |err| return mapReducerError(err)) |json_text| {
+        if (std.mem.eql(u8, json_text, "[DONE]")) break;
         if (reducer.applyJson(
             alloc,
             json_text,
@@ -555,8 +488,9 @@ fn consumeSse(
 
 fn mapReducerError(err: anyerror) anyerror {
     return switch (err) {
+        error.EventTooLarge => error.XaiGrokSseEventTooLarge,
+        error.StreamTooLarge => error.XaiGrokResourceLimitExceeded,
         error.InvalidEvent => error.InvalidXaiGrokSseEvent,
-        error.ResponseFailed => error.XaiGrokResponseFailed,
         error.StreamIncomplete => error.XaiGrokStreamIncomplete,
         error.ToolCallLimitExceeded => error.XaiGrokToolCallLimitExceeded,
         error.ToolArgumentsTooLarge => error.XaiGrokToolArgumentsTooLarge,
@@ -571,18 +505,19 @@ test "xAI Grok request uses Responses input and converts AI SDK tool schemas" {
         .description = "Read",
         .input_schema = .{},
     };
+    const instructions = [_]types.ChatMessage{.{ .role = .system, .content = "Be concise." }};
     const messages = [_]types.ChatMessage{
-        .{ .role = .system, .content = "Be concise." },
         .{ .role = .user, .content = "Read it." },
         .{
             .role = .assistant,
             .tool_calls = &.{.{ .id = "call_1", .name = "read_file", .arguments_json = "{\"path\":\"README.md\"}" }},
-            .provider_state_json = "[{\"id\":\"rs_1\",\"type\":\"reasoning\",\"encrypted_content\":\"opaque\"}]",
+            .provider_replay = .{ .source = .{ .provider = .grok, .model = "grok-4.20" }, .parts_json = "[{\"id\":\"rs_1\",\"type\":\"reasoning\",\"encrypted_content\":\"opaque\"}]" },
         },
         .{ .role = .tool, .tool_call_id = "call_1", .tool_name = "read_file", .content = "contents" },
     };
     const body = try buildRequest(std.testing.allocator, .{
         .model = "grok-4.20",
+        .instructions = &instructions,
         .messages = &messages,
         .tools = .{ .additional_functions = &.{read_file_schema} },
         .tool_choice = .auto,
@@ -937,6 +872,7 @@ const XaiTestEnvironment = struct {
         };
         errdefer self.map.deinit();
         try self.map.put(e2e_endpoint_env, responses_url);
+        try self.map.put("FX_E2E_GROK_CLIENT_VERSION", "1.0.6");
         io_mod.setEnvironMap(&self.map);
         return self;
     }
@@ -1089,7 +1025,7 @@ fn buildEventCountSse(alloc: Allocator, event_count: usize) ![]u8 {
 
 fn buildIgnoredAggregateSse(alloc: Allocator, wire_bytes: usize) ![]u8 {
     const mixed_ignored_and_data = ": keepalive\n\nretry: 1000\ndata: {}\n\n";
-    const terminal = "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n";
+    const terminal = "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n";
     if (wire_bytes < mixed_ignored_and_data.len + terminal.len) return error.NoSpaceLeft;
     var out: std.Io.Writer.Allocating = .init(alloc);
     errdefer out.deinit();
@@ -1134,23 +1070,22 @@ fn buildToolArgumentsSse(alloc: Allocator, argument_bytes: usize) ![]u8 {
 
 fn buildProviderStateSse(alloc: Allocator, provider_state_bytes: usize) ![]u8 {
     const item_count: usize = 8;
-    const event_prefix = "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":";
-    const item_prefix = "{\"id\":\"rs\",\"type\":\"reasoning\",\"encrypted_content\":\"";
+    const item_prefix = "{\"id\":\"rs";
+    const item_middle = "\",\"type\":\"reasoning\",\"encrypted_content\":\"";
     const item_suffix = "\"}";
     const event_suffix = "}\n\n";
     const terminal = "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n";
-    const framing_bytes = 2 + (item_count - 1) + item_count * (item_prefix.len + item_suffix.len);
+    const framing_bytes = 2 + (item_count - 1) + item_count * (item_prefix.len + 1 + item_middle.len + item_suffix.len);
     const content_bytes = provider_state_bytes - framing_bytes;
     const bytes_per_item = content_bytes / item_count;
     var remainder = content_bytes % item_count;
 
     var out: std.Io.Writer.Allocating = .init(alloc);
     errdefer out.deinit();
-    for (0..item_count) |_| {
+    for (0..item_count) |index| {
         const extra: usize = if (remainder > 0) 1 else 0;
         remainder -|= extra;
-        try out.writer.writeAll(event_prefix);
-        try out.writer.writeAll(item_prefix);
+        try out.writer.print("data: {{\"type\":\"response.output_item.done\",\"output_index\":{d},\"item\":{s}{d}{s}", .{ index, item_prefix, index, item_middle });
         try out.writer.splatByteAll('a', bytes_per_item + extra);
         try out.writer.writeAll(item_suffix);
         try out.writer.writeAll(event_suffix);
@@ -1161,21 +1096,23 @@ fn buildProviderStateSse(alloc: Allocator, provider_state_bytes: usize) ![]u8 {
 
 test "xAI Grok SSE reader accepts the exact line bound and rejects one beyond" {
     inline for (.{ max_sse_line_bytes, max_sse_line_bytes + 1 }) |line_bytes| {
-        const bytes = try std.testing.allocator.alloc(u8, line_bytes + 1);
+        const bytes = try std.testing.allocator.alloc(u8, line_bytes + 2);
         defer std.testing.allocator.free(bytes);
         @memcpy(bytes[0.."data: ".len], "data: ");
         @memset(bytes["data: ".len..line_bytes], 'a');
         bytes[line_bytes] = '\n';
+        bytes[line_bytes + 1] = '\n';
         var reader: std.Io.Reader = .fixed(bytes);
-        var sse: SseReader = .{};
+        var sse: sse_stream.Reader = .{ .max_event_bytes = max_sse_line_bytes };
         defer sse.deinit(std.testing.allocator);
+        const cancelled = std.atomic.Value(bool).init(false);
         if (line_bytes == max_sse_line_bytes) {
-            const value = (try sse.next(std.testing.allocator, &reader)).?;
+            const value = (try sse.next(std.testing.allocator, &reader, &cancelled)).?;
             try std.testing.expectEqual(max_sse_line_bytes - "data: ".len, value.len);
         } else {
             try std.testing.expectError(
-                error.XaiGrokSseEventTooLarge,
-                sse.next(std.testing.allocator, &reader),
+                error.EventTooLarge,
+                sse.next(std.testing.allocator, &reader, &cancelled),
             );
         }
     }

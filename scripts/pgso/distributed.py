@@ -1138,7 +1138,7 @@ def run_aggregate(arguments: argparse.Namespace) -> pathlib.Path:
     training = candidate_evidence.get("training")
     if not isinstance(training, dict):
         raise PgsoError("candidate manifest is missing aggregated training evidence")
-    destination = output / "candidate" / "fx"
+    destination = output / "candidate" / "omfx"
     destination.parent.mkdir(parents=True)
     shutil.copy2(candidate_paths.candidate_binary, destination)
     if sha256_file(destination) != candidate_hash:

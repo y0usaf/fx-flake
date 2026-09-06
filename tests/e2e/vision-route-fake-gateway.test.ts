@@ -502,7 +502,7 @@ async function expectChangedCanonicalVisionPathFailure(
 }
 
 function parseFxJson(result: Awaited<ReturnType<typeof runFx>>) {
-  expect(result.code).toBe(0);
+  expect(result.code, result.stdout + result.stderr).toBe(0);
   return JSON.parse(result.stdout.trim()) as {
     output: string;
     exit_code: number;
@@ -981,6 +981,7 @@ describe("Vision route fake Gateway", () => {
       writeFileSync(forbiddenPath, forbiddenContents);
       const gateway = startImageGateway([
         sseToolCall("read_file", { path: forbiddenPath }, "read_before_vision"),
+        sseToolCall("read_file", [], "non_object_before_vision"),
         sseToolCall("vision", { image_ids: [1], focus: "inspect" }, "vision_after_rejection"),
         sseText(VISION_RESULT),
         sseText("Recovered after required Vision rejection"),
@@ -1008,7 +1009,7 @@ describe("Vision route fake Gateway", () => {
         expect(json.output).toContain("Recovered after required Vision rejection");
         expect(json.tool_calls).toContainEqual({ name: "read_file", status: "error" });
         expect(json.tool_calls).toContainEqual({ name: "vision", status: "success" });
-        expect(gateway.chatRequests).toHaveLength(4);
+        expect(gateway.chatRequests).toHaveLength(5);
         expect(gateway.chatRequests[0].body).toContain('"toolChoice":{"type":"required"}');
         expect(gateway.chatRequests[1].body).toContain('"toolChoice":{"type":"required"}');
         expect(gateway.chatRequests[1].body).toContain("read_before_vision");
@@ -1016,10 +1017,14 @@ describe("Vision route fake Gateway", () => {
           "Only Vision can be called while attached images are pending.",
         );
         expect(gateway.chatRequests[1].body).not.toContain(forbiddenContents);
-        expect(gateway.chatRequests[2].headers.get("ai-language-model-id")).toBe(GEMINI_MODEL);
-        expect(filePartCount(gateway.chatRequests[2].body)).toBe(1);
-        expect(gateway.chatRequests[3].body).toContain("FX LOGO");
-        expect(gateway.chatRequests[3].body).not.toContain(forbiddenContents);
+        const rejectedCall = JSON.parse(gateway.chatRequests[2].body).prompt
+          .flatMap((message: { content: unknown }) => Array.isArray(message.content) ? message.content : [])
+          .find((part: { toolCallId?: string; type?: string }) => part.type === "tool-call" && part.toolCallId === "non_object_before_vision");
+        expect(rejectedCall.input).toEqual({});
+        expect(gateway.chatRequests[3].headers.get("ai-language-model-id")).toBe(GEMINI_MODEL);
+        expect(filePartCount(gateway.chatRequests[3].body)).toBe(1);
+        expect(gateway.chatRequests[4].body).toContain("FX LOGO");
+        expect(gateway.chatRequests[4].body).not.toContain(forbiddenContents);
       } finally {
         gateway.stop();
         rmSync(root.root, { recursive: true, force: true });

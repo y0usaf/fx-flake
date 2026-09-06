@@ -19,6 +19,57 @@ const McpHttpHeaderEnv = mcp_contract.McpHttpHeaderEnv;
 const McpServerConfig = mcp_contract.McpServerConfig;
 const McpTransport = mcp_contract.McpTransport;
 
+/// Configuration equality includes admission and credential policy. A changed
+/// value needs a new connection owner; equal separately allocated values do not.
+pub fn sameServerConfig(left: McpServerConfig, right: McpServerConfig) bool {
+    return sameConfigValue(McpServerConfig, left, right);
+}
+
+fn sameConfigValue(comptime T: type, left: T, right: T) bool {
+    return switch (@typeInfo(T)) {
+        .@"struct" => result: {
+            inline for (std.meta.fields(T)) |field| {
+                if (!sameConfigValue(field.type, @field(left, field.name), @field(right, field.name))) break :result false;
+            }
+            break :result true;
+        },
+        .optional => |optional| if (left) |value|
+            if (right) |other| sameConfigValue(optional.child, value, other) else false
+        else
+            right == null,
+        .pointer => |pointer| result: {
+            if (pointer.size != .slice) @compileError("MCP configuration may only borrow slices");
+            if (left.len != right.len) break :result false;
+            for (left, right) |value, other| {
+                if (!sameConfigValue(pointer.child, value, other)) break :result false;
+            }
+            break :result true;
+        },
+        .bool, .int, .@"enum" => left == right,
+        else => @compileError("Handle this MCP configuration value explicitly"),
+    };
+}
+
+test "server reuse compares owned configuration values and all authority fields" {
+    var first_name = [_]u8{ 'o', 'n', 'e' };
+    var second_name = first_name;
+    var first = McpServerConfig{ .name = &first_name, .command = "node", .args = &.{"server.js"} };
+    var second = first;
+    second.name = &second_name;
+    try std.testing.expect(sameServerConfig(first, second));
+    second.args = &.{"other.js"};
+    try std.testing.expect(!sameServerConfig(first, second));
+    second = first;
+    second.allow_stored_credentials = true;
+    try std.testing.expect(!sameServerConfig(first, second));
+    first.source = .workspace;
+    first.scope = .workspace;
+    first.workspace_admission = .approved;
+    second = first;
+    second.workspace_admission = .rejected;
+    try std.testing.expect(!sameServerConfig(first, second));
+}
+
 pub const enabled_servers_key = "enabledMcpjsonServers";
 pub const disabled_servers_key = "disabledMcpjsonServers";
 pub const enable_all_key = "enableAllProjectMcpServers";

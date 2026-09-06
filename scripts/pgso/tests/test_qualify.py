@@ -212,10 +212,10 @@ class PgsoQualificationTests(unittest.TestCase):
         self.assertEqual(49, len(result.candidate_samples))
 
     def test_startup_measurement_executes_immutable_artifacts_directly(self) -> None:
-        control = self.root / "control" / "fx"
-        candidate = self.root / "candidate" / "fx"
+        control = self.root / "control" / "omfx"
+        candidate = self.root / "candidate" / "omfx"
         hyperfine = self.root / "tools" / "hyperfine"
-        canonical = self.root / "zig-out" / "bin" / "fx"
+        canonical = self.root / "zig-out" / "bin" / "omfx"
         for path, contents in (
             (control, b"control"),
             (candidate, b"candidate"),
@@ -254,8 +254,8 @@ class PgsoQualificationTests(unittest.TestCase):
         self.assertNotIn(str(canonical), {command[0] for command in calls})
 
     def test_startup_measurement_runs_only_the_assigned_command(self) -> None:
-        control = self.root / "control" / "fx"
-        candidate = self.root / "candidate" / "fx"
+        control = self.root / "control" / "omfx"
+        candidate = self.root / "candidate" / "omfx"
         hyperfine = self.root / "tools" / "hyperfine"
         for path in (control, candidate, hyperfine):
             path.parent.mkdir(parents=True, exist_ok=True)
@@ -282,8 +282,8 @@ class PgsoQualificationTests(unittest.TestCase):
         self.assertEqual(100, sum(command[0] == str(hyperfine) for command in calls))
 
     def test_startup_measurement_uses_one_thousand_samples_in_balanced_blocks(self) -> None:
-        control = self.root / "control" / "fx"
-        candidate = self.root / "candidate" / "fx"
+        control = self.root / "control" / "omfx"
+        candidate = self.root / "candidate" / "omfx"
         hyperfine = self.root / "tools" / "hyperfine"
         for path in (control, candidate, hyperfine):
             path.parent.mkdir(parents=True, exist_ok=True)
@@ -333,8 +333,8 @@ class PgsoQualificationTests(unittest.TestCase):
         self.assertTrue(all(len(result.candidate_samples) == 1_000 for result in results))
 
     def test_startup_measurement_caps_large_campaign_blocks_at_ten_runs(self) -> None:
-        control = self.root / "control" / "fx"
-        candidate = self.root / "candidate" / "fx"
+        control = self.root / "control" / "omfx"
+        candidate = self.root / "candidate" / "omfx"
         hyperfine = self.root / "tools" / "hyperfine"
         for path in (control, candidate, hyperfine):
             path.parent.mkdir(parents=True, exist_ok=True)
@@ -383,8 +383,8 @@ class PgsoQualificationTests(unittest.TestCase):
         self.assertEqual((1_000,), tuple(len(result.candidate_samples) for result in results))
 
     def test_startup_measurement_disables_external_keychain_reads(self) -> None:
-        control = self.root / "control" / "fx"
-        candidate = self.root / "candidate" / "fx"
+        control = self.root / "control" / "omfx"
+        candidate = self.root / "candidate" / "omfx"
         hyperfine = self.root / "tools" / "hyperfine"
         for path in (control, candidate, hyperfine):
             path.parent.mkdir(parents=True, exist_ok=True)
@@ -476,8 +476,8 @@ class PgsoQualificationTests(unittest.TestCase):
             _read_hyperfine_samples(path, expected_samples=50)
 
     def test_startup_measurement_preserves_hyperfine_diagnostics(self) -> None:
-        control = self.root / "control" / "fx"
-        candidate = self.root / "candidate" / "fx"
+        control = self.root / "control" / "omfx"
+        candidate = self.root / "candidate" / "omfx"
         hyperfine = self.root / "tools" / "hyperfine"
         for path in (control, candidate, hyperfine):
             path.parent.mkdir(parents=True, exist_ok=True)

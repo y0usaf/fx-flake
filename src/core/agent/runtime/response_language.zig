@@ -24,8 +24,9 @@ pub const DecisionInput = struct {
 };
 
 pub fn evidence(text: []const u8) Evidence {
-    const observed = language_script.profile_prose(text);
-    const non_latin = language_script.profile_non_latin_prose(text);
+    const profiles = language_script.profile_prose_pair(text);
+    const observed = profiles.all;
+    const non_latin = profiles.non_latin;
     const minimum_unexpected_share = observed.letters / 5 +
         @as(usize, @intFromBool(observed.letters % 5 != 0));
     if (non_latin.script != null and

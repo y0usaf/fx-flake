@@ -5,8 +5,13 @@ import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createFxAgent } from "../node.js";
 
+let requestStartedResolve;
+const requestStarted = new Promise((resolveStarted) => { requestStartedResolve = resolveStarted; });
 const server = createServer((request) => {
+  assert.equal(request.method, "POST");
+  assert.equal(request.url, "/stall");
   request.resume();
+  request.once("end", requestStartedResolve);
 });
 await new Promise((resolveListen) => server.listen(0, "127.0.0.1", resolveListen));
 const { port } = server.address();
@@ -17,14 +22,16 @@ const timeout = (label, ms = 5000) => new Promise((_, reject) => {
 });
 try {
   let aborted = false;
-  let fetchStartedResolve;
-  const fetchStarted = new Promise((resolveStarted) => { fetchStartedResolve = resolveStarted; });
   const agent = await createFxAgent({
     nativeAddon: addon,
     backend: "native",
     fetch(input, init) {
+      if (init.method === "GET") {
+        return Response.json({ object: "list", data: [{ id: "native/test-model", type: "language" }] });
+      }
+      assert.equal(init.method, "POST");
+      assert.equal(input, `http://127.0.0.1:${port}/stall`);
       init.signal.addEventListener("abort", () => { aborted = true; }, { once: true });
-      fetchStartedResolve();
       return fetch(input, init);
     },
     apiKey: "native-core-cancel-key",
@@ -32,7 +39,7 @@ try {
     model: "native/test-model",
   });
   const turn = agent.prompt("stall");
-  await Promise.race([fetchStarted, timeout("stalled gateway fetch")]);
+  await Promise.race([requestStarted, timeout("stalled gateway POST")]);
   turn.cancel();
   const result = await Promise.race([turn.result, timeout("native cancellation")]);
   assert.equal(result.stopReason, "cancelled");

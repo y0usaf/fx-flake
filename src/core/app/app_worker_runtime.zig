@@ -22,7 +22,6 @@ const interaction_state = @import("../../ui/footer/interaction_state.zig");
 const render_request = @import("../../ui/render_request.zig");
 const transcript_runtime = @import("../../ui/transcript/runtime.zig");
 
-const QueuePreview = worker_runtime.QueuePreview;
 const WorkerEvent = worker_runtime.WorkerEvent;
 const InputRuntime = core_input_runtime.Runtime;
 
@@ -56,7 +55,10 @@ fn discardCodeBlock(_: *anyopaque, block: assistant_presentation.CodeBlockPayloa
 }
 
 fn discardThematicRule(_: *anyopaque) !void {}
-fn discardContextCompaction(_: *anyopaque, _: types.HistoryTurn) !void {}
+fn discardContextCompaction(_: *anyopaque, _: worker_runtime.ContextCompaction) !void {}
+fn unavailableFreshPrompt(_: *anyopaque, _: worker_runtime.FreshPromptPreparation) !worker_runtime.FreshPromptHistory {
+    return error.SessionPersistenceUnavailable;
+}
 fn discardCredentialRefresh(_: *anyopaque, _: credentials.Credential) !void {}
 
 pub const WorkerEventHandlers = struct {
@@ -75,7 +77,8 @@ pub const WorkerEventHandlers = struct {
     command_output: *const fn (*anyopaque, ?types.ToolLifecycleId, command_output_content.Stream, []const u8) anyerror!void,
     command_output_complete: *const fn (*anyopaque, ?types.ToolLifecycleId) anyerror!void,
     diff_block: *const fn (*anyopaque, diff_mod.DiffEntryPayload) anyerror!void,
-    context_compaction: *const fn (*anyopaque, types.HistoryTurn) anyerror!void = discardContextCompaction,
+    context_compaction: worker_runtime.ContextCompactionHandler = discardContextCompaction,
+    prepare_fresh_prompt: worker_runtime.FreshPromptHandler = unavailableFreshPrompt,
     append_history_turn: *const fn (*anyopaque, types.FinishedPrompt) anyerror!void,
     session_grant: *const fn (*anyopaque, types.PermissionGrant) anyerror!void,
     error_text: *const fn (*anyopaque, types.SemanticNotice) anyerror!void,
@@ -85,6 +88,148 @@ pub const AssistantTextDrainResult = enum {
     drained,
     blocked,
 };
+
+test "shutdown settles queued and pacer-owned finishes exactly once" {
+    const session_runtime = @import("../session/session.zig");
+    const session_store = @import("../session/session_store.zig");
+    const session_codec = @import("../session/session_codec.zig");
+    const ShutdownApp = struct {
+        alloc: std.mem.Allocator,
+        session: session_runtime.SessionRuntime = .{ .max_history_turns = 8 },
+        session_persistence: app_session_runtime.Persistence = .{},
+        worker: worker_runtime.WorkerRuntime = .{},
+        pacer: assistant_pacer.AssistantPacer = .{},
+        total_input_tokens: u64 = 7,
+        total_output_tokens: u64 = 11,
+    };
+    const Ownership = struct {
+        references: usize = 0,
+        transfers: usize = 0,
+
+        fn retain(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.references += 1;
+        }
+        fn release(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.references -= 1;
+        }
+        fn transfer(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.transfers += 1;
+        }
+        fn handle(self: *@This()) types.SnapshotFileOwnership {
+            return .{ .ctx = self, .retain_fn = retain, .release_fn = release, .transfer_fn = transfer };
+        }
+    };
+    const alloc = std.testing.allocator;
+    for ([_]bool{ false, true }) |pacer_owned| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+        defer alloc.free(root);
+        var app: ShutdownApp = .{ .alloc = alloc };
+        defer app.session.deinit(alloc);
+        defer app.session_persistence.deinit(alloc);
+        defer app.worker.deinit(std.heap.c_allocator);
+        defer app.pacer.deinit(alloc);
+        app.session_persistence.store = try session_store.Store.initFromHome(alloc, root, root);
+        const store = &app.session_persistence.store.?;
+        app.session_persistence.writable = try store.startWritableSession(alloc, .{
+            .id = @constCast("shutdown-finish"),
+            .origin_workspace_root = @constCast(root),
+            .workspace_root = @constCast(root),
+            .created_at_ms = 1,
+            .updated_at_ms = 1,
+            .conversation_language = .literal("en"),
+            .history = &.{},
+            .total_input_tokens = 0,
+            .total_output_tokens = 0,
+            .preferences = .{ .model = @constCast("test-model"), .effort = .auto, .fast_mode = false },
+        });
+        const checkpoint: session_codec.RecoveryCheckpoint = .{
+            .turn_id = 41,
+            .user = .{ .text = @constCast("cancel this response") },
+            .assistant_source = @constCast("partial response"),
+            .cause = .response_interrupted,
+            .action = .continuing_response,
+            .authority = .{ .provider = .gateway, .model = @constCast("test-model") },
+            .requested_fast_mode = false,
+            .fast_mode = false,
+            .max_provider_attempts = 10,
+            .consumed_provider_attempts = 1,
+        };
+        try app_session_runtime.Runtime(ShutdownApp).setRecoveryCheckpoint(&app, checkpoint);
+        var usage = try app.session.usage.snapshot(alloc);
+        defer usage.deinit(alloc);
+        var models = [_]@import("../session/session_usage.zig").ModelAggregate{.{
+            .model = @constCast("test-model"),
+            .first_sequence = 1,
+            .input_tokens = 7,
+            .output_tokens = 11,
+            .reasoning_tokens = usage.reasoning_tokens,
+            .request_count = usage.request_count,
+        }};
+        const empty_models = usage.models;
+        usage.models = &models;
+        defer usage.models = empty_models;
+        usage.input_tokens = 7;
+        usage.output_tokens = 11;
+        usage.next_sequence = 2;
+        usage.settled_through_sequence = 1;
+        try app_session_runtime.Runtime(ShutdownApp).persistUsageCheckpoint(&app, usage);
+
+        var ownership: Ownership = .{};
+        const summary: types.TurnSummary = .{ .token_progress = .{ .input_tokens = 7, .output_tokens = 11 } };
+        const finished: types.FinishedPrompt = .{
+            .turn = checkpoint.interruptedTurn(),
+            .summary = summary,
+            .terminal_outcome = .interrupted,
+            .snapshot_file_ownership = ownership.handle(),
+        };
+        if (pacer_owned) {
+            try app.pacer.enqueue(alloc, "unrendered tail");
+            try std.testing.expect(try app.pacer.deferFinish(alloc, finished));
+        } else {
+            try app.worker.pushEvent(std.heap.c_allocator, .{ .finish_prompt = finished });
+        }
+        // A later queued finish must follow the pacer-owned turn. Neither a
+        // begin nor a presentation event may invoke UI or admit another prompt.
+        try app.worker.pushEvent(std.heap.c_allocator, .{ .begin_prompt = .{ .text = @constCast("later prompt") } });
+        try app.worker.pushEvent(std.heap.c_allocator, .{ .assistant_presentation = .{ .text = @constCast("do not render") } });
+        try app.worker.pushEvent(std.heap.c_allocator, .{ .finish_prompt = .{ .turn = .{ .assistant = .{
+            .user = .{ .text = @constCast("later prompt") },
+            .assistant = @constCast("later answer"),
+        } } } });
+        app.worker.requestShutdown();
+        try std.testing.expectEqual(@as(usize, 0), app.session.historyLen());
+        try std.testing.expect(app.session_persistence.writable.?.state.recovery_checkpoint != null);
+
+        try Runtime(ShutdownApp).settleFinishedPromptsForShutdown(&app);
+        try Runtime(ShutdownApp).settleFinishedPromptsForShutdown(&app);
+        try std.testing.expectEqual(@as(usize, 2), app.session.historyLen());
+        try std.testing.expectEqual(@as(usize, 1), ownership.transfers);
+        try std.testing.expectEqual(@as(usize, 0), ownership.references);
+        try std.testing.expectEqual(@as(usize, 0), app.worker.worker_events.items.len);
+        try std.testing.expect(app.pacer.deferred_turn == null);
+        try std.testing.expect(app.session_persistence.writable.?.state.recovery_checkpoint == null);
+        try std.testing.expect(!app.session_persistence.writable.?.conversation_writer.turn_open);
+        // Close the actual writer before reload so only durable state can pass.
+        app.session_persistence.writable.?.deinit(alloc);
+        app.session_persistence.writable = null;
+        var loaded = try store.loadReadOnly(alloc, "shutdown-finish");
+        defer loaded.deinit(alloc);
+        try std.testing.expectEqual(@as(usize, 2), loaded.history.len);
+        try std.testing.expectEqualStrings("partial response", loaded.history[0].interrupted.assistant.?);
+        try std.testing.expectEqualDeep(summary, types.historyTurnSummary(loaded.history[0]).?);
+        try std.testing.expectEqualStrings("later answer", loaded.history[1].assistant.assistant);
+        try std.testing.expect(loaded.recovery_checkpoint == null);
+        try std.testing.expectEqual(@as(u64, 7), loaded.usage.?.input_tokens);
+        try std.testing.expectEqual(@as(u64, 11), loaded.usage.?.output_tokens);
+        try std.testing.expectEqual(@as(u64, 2), loaded.usage.?.next_sequence);
+        try std.testing.expectEqual(@as(u64, 1), loaded.usage.?.settled_through_sequence);
+    }
+}
 
 const DetachedWorkerEventBatch = struct {
     alloc: std.mem.Allocator,
@@ -221,6 +366,7 @@ pub fn Runtime(comptime App: type) type {
                 .clear_route_recovery_status,
                 .api_status_text,
                 .context_compaction,
+                .prepare_fresh_prompt,
                 .credential_refreshed,
                 .finish_prompt,
                 .session_grant,
@@ -238,6 +384,30 @@ pub fn Runtime(comptime App: type) type {
             return record.phase == .terminal and record.activity_kind == .command;
         }
 
+        /// After the worker joins, persist finished turns without presenting output
+        /// or admitting work. The pacer owns the finish preceding queued events.
+        pub fn settleFinishedPromptsForShutdown(app: *App) !void {
+            if (app.pacer.deferred_turn) |finished| {
+                app.pacer.deferred_turn = null;
+                app.pacer.deferred_started_ns = null;
+                defer types.freeFinishedPrompt(app.alloc, finished);
+                try app_session_runtime.Runtime(App).appendFinishedPrompt(app, finished);
+            }
+
+            var batch = DetachedWorkerEventBatch.init(
+                std.heap.c_allocator,
+                app.worker.takeEvents(),
+            );
+            defer batch.deinit();
+            while (batch.claim()) |event| {
+                defer worker_runtime.freeWorkerEvent(batch.alloc, event);
+                switch (event) {
+                    .finish_prompt => |finished| try app_session_runtime.Runtime(App).appendFinishedPrompt(app, finished),
+                    else => debug_trace.logf("worker", "shutdown worker event dropped kind={s}", .{@tagName(event)}),
+                }
+            }
+        }
+
         pub fn authorizeInteractiveAdmission(app: *App) !bool {
             if (comptime @hasDecl(@TypeOf(app.worker), "interactiveAdmissionSnapshot")) {
                 switch (app.worker.interactiveAdmissionSnapshot()) {
@@ -252,10 +422,6 @@ pub fn Runtime(comptime App: type) type {
                 }
             }
             return true;
-        }
-
-        pub fn queuePreview(app: *App) QueuePreview {
-            return app.worker.queuePreview();
         }
 
         pub fn syncQueuedPromptModel(app: *App, model: []const u8) !void {
@@ -287,19 +453,22 @@ pub fn Runtime(comptime App: type) type {
 
         pub fn commitContextCompaction(
             app: *App,
-            turn: types.HistoryTurn,
+            summary: types.CompactedSummaryHistoryTurn,
+            active_prefix: ?types.AssistantHistoryTurn,
+            retained_from: ?types.ContextHistoryCut,
             max_history_turns: usize,
         ) !void {
             if (comptime @hasDecl(@TypeOf(app.worker), "commitContextCompaction")) {
                 try app.worker.commitContextCompaction(
                     std.heap.c_allocator,
-                    turn,
+                    summary,
+                    active_prefix,
+                    retained_from,
                     max_history_turns,
                 );
                 return;
             }
-            try propagateHistoryTurn(app, turn, max_history_turns);
-            try pushEvent(app, .{ .context_compaction = turn });
+            return error.ContextCompactionPersistenceUnavailable;
         }
 
         pub fn propagateGrant(app: *App, tool_name: []const u8, target_path: []const u8) !void {
@@ -434,6 +603,16 @@ pub fn Runtime(comptime App: type) type {
             try pushOwnedEvent(app, .{ .diff_block = payload });
         }
 
+        /// Activate an admitted continuation without presenting another user turn.
+        pub fn beginRecoveryPresentation(app: *App) void {
+            app.stream = .{
+                .active = true,
+                .turn_started_ms = io_mod.milliTimestamp(),
+            };
+            _ = app.shell.worker_status_state().clear();
+            app.shell.render_requests.request(.footer);
+        }
+
         pub fn syncState(
             app: *App,
             presenter: activity_runtime.LifecyclePresenter,
@@ -507,10 +686,6 @@ pub fn Runtime(comptime App: type) type {
             }
 
             const modal_active = app.approval_prompt.isActive() or app.question_prompt.isActive();
-            const queue_review_active = if (comptime @hasField(@TypeOf(snapshot), "queue_review_reason"))
-                snapshot.queue_review_reason != null
-            else
-                false;
             const worker_events_pending = if (comptime @hasField(@TypeOf(snapshot), "pending_event_count"))
                 snapshot.pending_event_count > 0
             else
@@ -521,7 +696,7 @@ pub fn Runtime(comptime App: type) type {
                 !cancellation_stops_turn and
                 (snapshot.processing or
                     worker_events_pending or
-                    (snapshot.queued_count > 0 and !queue_review_active));
+                    snapshot.queued_count > 0);
             const awaiting_tool_terminal = snapshot.cancel_requested and
                 activeToolStatusCount(presenter) > 0;
             if (!modal_active and
@@ -623,6 +798,9 @@ pub fn Runtime(comptime App: type) type {
         }
 
         fn drainEvents(app: *App, handlers: WorkerEventHandlers) !void {
+            errdefer if (comptime @hasDecl(@TypeOf(app.worker), "failPendingHistoryPublication")) {
+                app.worker.failPendingHistoryPublication(error.HistoryPublicationDeliveryFailed);
+            };
             const taken = app.worker.takeEventBatch();
             var batch = DetachedWorkerEventBatch.init(
                 std.heap.c_allocator,
@@ -868,8 +1046,21 @@ pub fn Runtime(comptime App: type) type {
                         drain_owns_current = false;
                         try handlers.diff_block(handlers.ctx, payload);
                     },
-                    .context_compaction => |turn| {
-                        try handlers.context_compaction(handlers.ctx, turn);
+                    .context_compaction => |value| {
+                        if (comptime @hasDecl(@TypeOf(app.worker), "resolveContextCompaction")) {
+                            app.worker.resolveContextCompaction(
+                                std.heap.c_allocator,
+                                value,
+                                handlers.ctx,
+                                handlers.context_compaction,
+                            );
+                        } else {
+                            try handlers.context_compaction(handlers.ctx, value);
+                        }
+                    },
+                    .prepare_fresh_prompt => |value| {
+                        const current = app_session_runtime.Runtime(App).normalizeFreshPromptPreparation(app, value);
+                        app.worker.resolveFreshPrompt(std.heap.c_allocator, current, handlers.ctx, handlers.prepare_fresh_prompt);
                     },
                     .tool_lifecycle => |lifecycle| {
                         switch (lifecycle) {
@@ -1151,14 +1342,14 @@ const FakeWorker = struct {
     reset_cancel_after_take_events: bool = false,
     admission_snapshot: worker_runtime.InteractiveAdmissionSnapshot = .open,
 
+    fn resolveFreshPrompt(_: *FakeWorker, alloc: std.mem.Allocator, value: worker_runtime.FreshPromptPreparation, ctx: *anyopaque, handler: worker_runtime.FreshPromptHandler) void {
+        var result = handler(ctx, value) catch return;
+        result.deinit(alloc);
+    }
+
     fn deinit(self: *FakeWorker) void {
         for (self.events.items) |event| worker_runtime.freeWorkerEvent(std.heap.c_allocator, event);
         self.events.deinit(std.heap.c_allocator);
-    }
-
-    fn queuePreview(self: *FakeWorker) QueuePreview {
-        _ = self;
-        return .{};
     }
 
     fn pushEvent(self: *FakeWorker, alloc: std.mem.Allocator, event: WorkerEvent) !void {
@@ -2489,7 +2680,6 @@ test "core.app_worker_runtime suppresses route recovery activity while question 
         .stream = app.stream,
         .has_api_key = true,
         .model = "gpt-5.1",
-        .queued_count = 0,
         .question = .{
             .current_entry = null,
             .current_index = 0,
@@ -2524,6 +2714,31 @@ test "core.app_worker_runtime syncState does not start activity for idle queued 
 
     try std.testing.expect(!app.stream.active);
     try std.testing.expect(!app.shell.render_requests.hasReason(.footer));
+}
+
+test "core.app_worker_runtime admitted recovery activates progress without resetting command display" {
+    var app = FakeApp.init(std.testing.allocator);
+    defer app.deinit();
+    try app.worker.pushEvent(std.heap.c_allocator, .{ .route_recovery_status = .{
+        .kind = .terminal_provider_error,
+        .failed_attempt = 1,
+        .attempt_limit = 10,
+        .action = .paused,
+    } });
+    try tickNoop(&app);
+    app.shell.command_output_display.touched = true;
+    app.worker.queued_count = 1;
+
+    Runtime(FakeApp).beginRecoveryPresentation(&app);
+    Runtime(FakeApp).syncState(&app, NoopBridge.lifecyclePresenter(&app));
+
+    try std.testing.expect(app.stream.active);
+    try std.testing.expectEqual(types.TurnPhase.thinking, app.stream.phase);
+    try std.testing.expect(app.stream.turn_started_ms > 0);
+    try std.testing.expect(app.shell.activityProjection() == .none);
+    try std.testing.expect(app.shell.command_output_display.touched);
+    try std.testing.expect(app.shell.render_requests.hasReason(.footer));
+    try std.testing.expectEqual(@as(usize, 0), app.worker.events.items.len);
 }
 
 test "core.app_worker_runtime syncState does not start activity for idle processing snapshot" {

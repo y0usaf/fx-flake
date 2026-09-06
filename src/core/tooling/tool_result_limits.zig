@@ -69,6 +69,37 @@ pub fn prepareModelOutputWithTruncation(
     };
 }
 
+/// Returns an owned, bounded model projection without replacing secret-like
+/// text. This is reserved for explicit `read_tool_result` retrieval, where the
+/// model requested exact bytes from an already bounded result page or query.
+pub fn prepareUnmaskedModelOutputWithTruncation(
+    alloc: Allocator,
+    tool_name: []const u8,
+    raw: []const u8,
+    max_bytes: usize,
+) error{OutOfMemory}!PreparedModelOutput {
+    var scratch_impl = std.heap.ArenaAllocator.init(alloc);
+    defer scratch_impl.deinit();
+    const scratch = scratch_impl.allocator();
+
+    const sanitized = try text_utils.sanitizeModelText(scratch, raw);
+    const capped = try truncateText(scratch, .{
+        .text = sanitized,
+        .max_bytes = max_bytes,
+        .marker = try std.fmt.allocPrint(
+            scratch,
+            "\n... [tool result truncated for {s}: original {d} bytes; cap is {d} bytes]\n",
+            .{ tool_name, sanitized.len, max_bytes },
+        ),
+        .trace_scope = "tool",
+        .trace_label = tool_name,
+    });
+    return .{
+        .model_output = try alloc.dupe(u8, capped),
+        .truncated = sanitized.len > max_bytes,
+    };
+}
+
 fn redactModelText(
     alloc: Allocator,
     raw: []const u8,
@@ -171,6 +202,21 @@ test "prepareModelOutput masks quoted sensitive assignments" {
     defer alloc.free(@constCast(output));
 
     try std.testing.expectEqualStrings("API_KEY=\"[redacted]\"", output);
+}
+
+test "prepareUnmaskedModelOutput preserves secret-like text" {
+    const alloc = std.testing.allocator;
+    const raw = "TOOL_DATA_TOKEN=0123456789abcdef01234567";
+    const prepared = try prepareUnmaskedModelOutputWithTruncation(
+        alloc,
+        "read_tool_result",
+        raw,
+        default_max_tool_result_bytes,
+    );
+    defer alloc.free(prepared.model_output);
+
+    try std.testing.expectEqualStrings(raw, prepared.model_output);
+    try std.testing.expect(!prepared.truncated);
 }
 
 test "prepareInlineResult does not classify redaction shrink as cap loss" {

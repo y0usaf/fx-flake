@@ -95,7 +95,7 @@ fn inputDeinit(ptr: *anyopaque, alloc: Allocator) void {
 
 fn classifyHandleNormalization(handle: []const u8) HandleNormalization {
     const trimmed = std.mem.trim(u8, handle, " \t\r\n");
-    const suffix = if (std.mem.startsWith(u8, trimmed, "result-") and
+    const suffix = if ((std.mem.startsWith(u8, trimmed, "result-") or result_store.isImageHandle(trimmed)) and
         std.mem.findScalar(u8, trimmed, '.') == null)
         ".txt"
     else
@@ -117,6 +117,23 @@ pub fn validate(ctx: tool_dispatch.DispatchContext, erased: tool_dispatch.ToolIn
 
 pub fn call(ctx: tool_dispatch.DispatchContext, erased: tool_dispatch.ToolInput) tool_dispatch.DispatchError!tool_dispatch.ToolResult {
     const input = erased.as(Input);
+    if (result_store.isImageHandle(input.handle)) {
+        const capability = ctx.session_child_capability orelse return .{
+            .failure = try ctx.allocator.dupe(u8, "No active session image store is available."),
+        };
+        if (input.selector == .query or input.selector.range.start_byte != 1) return .{
+            .failure = try ctx.allocator.dupe(u8, "Stored images are read as complete images. Use the handle without a query or byte offset."),
+        };
+        const images = result_store.loadToolImages(ctx.allocator, capability, input.handle) catch |err| return .{
+            .failure = try formatReadFailure(ctx.allocator, input.handle, err),
+        };
+        errdefer @import("../../core/shared/types.zig").freeToolImages(ctx.allocator, images);
+        return .{ .rich = .{
+            .text = try ctx.allocator.dupe(u8, "Stored tool images loaded."),
+            .images = images,
+            .is_error = false,
+        } };
+    }
     if (ctx.session_child_capability == null and
         ctx.ephemeral_command_replay == null and
         ctx.tool_result_dir == null)
@@ -356,6 +373,7 @@ test "unknown read_tool_result handle returns failure for legacy and managed sto
     const legacy_result = try call(.{ .allocator = alloc, .tool_result_dir = dir }, legacy_input);
     defer legacy_result.deinit(alloc);
     switch (legacy_result) {
+        .rich => return error.TestUnexpectedRichResult,
         .failure => |body| try std.testing.expectEqualStrings(expected, body),
         .success => return error.TestExpectedFailure,
     }
@@ -390,6 +408,7 @@ test "unknown read_tool_result handle returns failure for legacy and managed sto
     const managed_result = try call(.{ .allocator = alloc, .session_child_capability = &capability }, managed_input);
     defer managed_result.deinit(alloc);
     switch (managed_result) {
+        .rich => return error.TestUnexpectedRichResult,
         .failure => |body| try std.testing.expectEqualStrings(expected, body),
         .success => return error.TestExpectedFailure,
     }
@@ -443,8 +462,8 @@ test "read_tool_result pages and searches saved command replay handles" {
     }, &page_input);
     defer alloc.free(page);
     try std.testing.expect(std.mem.find(u8, page, "[stdout]") != null);
-    try std.testing.expect(std.mem.find(u8, page, "TOKEN=[redacted]") != null);
-    try std.testing.expect(std.mem.find(u8, page, "secret-value") == null);
+    try std.testing.expect(std.mem.find(u8, page, "TOKEN=secret-value") != null);
+    try std.testing.expect(std.mem.find(u8, page, "[redacted]") == null);
     try std.testing.expect(std.mem.find(u8, page, "needle tail") != null);
 
     var query_input = Input{

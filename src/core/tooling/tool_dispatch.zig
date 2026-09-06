@@ -1,4 +1,5 @@
 const std = @import("std");
+const skill_contract = @import("../skills/skill_contract.zig");
 const command_admission = @import("../permissions/command_admission.zig");
 const core_permissions = @import("../permissions/permissions.zig");
 const core_types = @import("../shared/types.zig");
@@ -116,6 +117,7 @@ pub const SelectedDynamicToolSinkFn = *const fn (
     ?*anyopaque,
     []const u8,
     []const u8,
+    ?tool_mcp_runtime.Binding,
 ) error{OutOfMemory}!void;
 
 pub const ContextNoticeSinkFn = *const fn (?*anyopaque, []const u8) error{OutOfMemory}!void;
@@ -144,15 +146,30 @@ pub const ToolInput = struct {
 pub const ToolResult = union(enum) {
     success: []u8,
     failure: []u8,
+    rich: struct { text: []u8, images: []core_types.ToolImage, is_error: bool = false },
 
-    /// Frees the owned result text.
+    /// Frees the owned result text and media.
     pub fn deinit(self: ToolResult, alloc: Allocator) void {
         switch (self) {
             .success => |body| alloc.free(body),
             .failure => |body| alloc.free(body),
+            .rich => |content| {
+                alloc.free(content.text);
+                core_types.freeToolImages(alloc, content.images);
+            },
         }
     }
+
+    pub fn intoAuthorized(self: ToolResult) AuthorizedDispatchResult {
+        return switch (self) {
+            .success => |body| .{ .status = .success, .body = body },
+            .failure => |body| .{ .status = .failure, .body = body },
+            .rich => |content| .{ .status = if (content.is_error) .failure else .success, .body = content.text, .images = content.images },
+        };
+    }
 };
+
+pub const ModelContentKind = enum { ordinary, complete_skill };
 
 pub const HostToolProviderFn = *const fn (
     *anyopaque,
@@ -247,6 +264,8 @@ pub const DispatchContext = struct {
     max_tool_result_bytes: usize = tool_result_limits.default_max_tool_result_bytes,
     max_command_output_bytes: usize = tool_result_limits.default_max_tool_result_bytes,
     skills_dir: []const u8 = "",
+    skill_locations: ?*const skill_contract.Locations = null,
+    resolved_skill: ?*const skill_contract.PreparedSkill = null,
     context_limits: context_limits.Values = .{},
     permission_ctx: ?*const PermissionContext = null,
     read_tracker: ?*read_tracker_mod.ReadTracker = null,
@@ -302,6 +321,7 @@ pub const DispatchContext = struct {
     web_search_completion_sink: ?*?core_types.WebSearchCompletion = null,
     web_fetch_completion_sink: ?*?core_types.WebFetchCompletion = null,
     tool_result_memory_sink: ?*?core_types.ToolResultMemory = null,
+    model_content_kind_sink: ?*ModelContentKind = null,
     command_result_json_sink: ?*?[]const u8 = null,
     turn_control_sink: ?*?TurnControl = null,
     result_commit_sink: ?*?result_commit.Token = null,
@@ -412,6 +432,7 @@ pub const ExecutorKind = enum {
     glob_files,
     grep_files,
     read_file,
+    ast_symbols,
     read_tool_result,
     write_file,
     edit_file,
@@ -422,6 +443,7 @@ pub const ExecutorKind = enum {
     skill,
     install_skill,
     subagent,
+    capability_search,
     mcp_select_tool,
     mcp_features,
     ask_user_question,
@@ -491,6 +513,7 @@ pub const Tool = struct {
     cancel_if_requested_after_call: bool = false,
     run_command_compatibility: ?RunCommandCompatibility = null,
     take_file_mutation_input_fn: ?TakeFileMutationInputFn = null,
+    prepare_skill_call_fn: ?*const fn (DispatchContext, []const u8) DispatchError!skill_contract.CallPreparation = null,
     reads_only_fn: ReadsOnlyFn,
     irreversible_fn: IrreversibleFn,
 };
@@ -793,8 +816,10 @@ pub fn admitToolCall(ctx: DispatchContext, registry: Registry, call: message.Too
 
 /// Owned tool-result message body produced by dispatch.
 pub const DispatchResult = struct {
+    model_content_kind: ModelContentKind = .ordinary,
     status: Status,
     body: []u8,
+    images: []core_types.ToolImage = &.{},
     status_detail: ?[]u8 = null,
     inner_usage: ?core_types.ToolUsage = null,
     web_search_completion: ?core_types.WebSearchCompletion = null,
@@ -811,6 +836,7 @@ pub const DispatchResult = struct {
     /// Frees the owned tool-result body and optional diagnostic detail.
     pub fn deinit(self: DispatchResult, alloc: Allocator) void {
         alloc.free(self.body);
+        core_types.freeToolImages(alloc, self.images);
         if (self.status_detail) |detail| alloc.free(detail);
         if (self.command_result_json) |json| alloc.free(@constCast(json));
         if (self.tool_result_memory) |memory| {
@@ -828,9 +854,11 @@ pub const DispatchResult = struct {
 pub const AuthorizedDispatchResult = struct {
     status: DispatchResult.Status,
     body: []u8,
+    images: []core_types.ToolImage = &.{},
 
     pub fn deinit(self: AuthorizedDispatchResult, alloc: Allocator) void {
         alloc.free(self.body);
+        core_types.freeToolImages(alloc, self.images);
     }
 };
 
@@ -840,12 +868,15 @@ pub fn dispatchToolCall(ctx: DispatchContext, registry: Registry, call: message.
     var captured_web_search_completion: ?core_types.WebSearchCompletion = null;
     var captured_web_fetch_completion: ?core_types.WebFetchCompletion = null;
     var captured_tool_result_memory: ?core_types.ToolResultMemory = null;
+    var captured_model_content_kind: ModelContentKind = .ordinary;
     var captured_command_result_json: ?[]const u8 = null;
     var call_ctx = ctx;
     if (call_ctx.inner_usage_sink == null) call_ctx.inner_usage_sink = &captured_usage;
     if (call_ctx.web_search_completion_sink == null) call_ctx.web_search_completion_sink = &captured_web_search_completion;
     if (call_ctx.web_fetch_completion_sink == null) call_ctx.web_fetch_completion_sink = &captured_web_fetch_completion;
     if (call_ctx.tool_result_memory_sink == null) call_ctx.tool_result_memory_sink = &captured_tool_result_memory;
+    if (call_ctx.model_content_kind_sink == null) call_ctx.model_content_kind_sink = &captured_model_content_kind;
+    call_ctx.model_content_kind_sink.?.* = .ordinary;
     if (call_ctx.command_result_json_sink == null) call_ctx.command_result_json_sink = &captured_command_result_json;
 
     const admission = try admitToolCall(call_ctx, registry, call);
@@ -861,25 +892,20 @@ pub fn dispatchToolCall(ctx: DispatchContext, registry: Registry, call: message.
             const web_fetch_completion = if (admitted.context.web_fetch_completion_sink) |slot| slot.* else captured_web_fetch_completion;
             const tool_result_memory = if (admitted.context.tool_result_memory_sink) |slot| slot.* else captured_tool_result_memory;
             const command_result_json = if (admitted.context.command_result_json_sink) |slot| slot.* else captured_command_result_json;
-            return switch (result) {
-                .success => |body| .{
-                    .status = .success,
-                    .body = body,
-                    .inner_usage = inner_usage,
-                    .web_search_completion = web_search_completion,
-                    .web_fetch_completion = web_fetch_completion,
-                    .tool_result_memory = tool_result_memory,
-                    .command_result_json = command_result_json,
-                },
-                .failure => |body| .{
-                    .status = .failure,
-                    .body = body,
-                    .inner_usage = inner_usage,
-                    .web_search_completion = web_search_completion,
-                    .web_fetch_completion = web_fetch_completion,
-                    .tool_result_memory = tool_result_memory,
-                    .command_result_json = command_result_json,
-                },
+            const output = result.intoAuthorized();
+            return .{
+                .status = output.status,
+                .model_content_kind = if (output.status == .success)
+                    if (admitted.context.model_content_kind_sink) |kind| kind.* else .ordinary
+                else
+                    .ordinary,
+                .body = output.body,
+                .images = output.images,
+                .inner_usage = inner_usage,
+                .web_search_completion = web_search_completion,
+                .web_fetch_completion = web_fetch_completion,
+                .tool_result_memory = tool_result_memory,
+                .command_result_json = command_result_json,
             };
         },
     }
@@ -928,16 +954,7 @@ pub fn dispatchAuthorizedToolCallDefault(ctx: DispatchContext, registry: Registr
                 result.deinit(ctx.allocator);
                 return error.Cancelled;
             }
-            return switch (result) {
-                .success => |body| .{
-                    .status = .success,
-                    .body = body,
-                },
-                .failure => |body| .{
-                    .status = .failure,
-                    .body = body,
-                },
-            };
+            return result.intoAuthorized();
         },
     }
 }
@@ -981,9 +998,10 @@ pub fn reportSelectedDynamicTool(
     ctx: DispatchContext,
     name: []const u8,
     schema_json: []const u8,
+    binding: ?tool_mcp_runtime.Binding,
 ) error{OutOfMemory}!void {
     const sink = ctx.on_selected_dynamic_tool orelse return;
-    try sink(ctx.selected_dynamic_tool_ctx, name, schema_json);
+    try sink(ctx.selected_dynamic_tool_ctx, name, schema_json, binding);
 }
 
 pub fn reportContextNotice(ctx: DispatchContext, notice: []const u8) error{OutOfMemory}!void {

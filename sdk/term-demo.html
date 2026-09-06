@@ -10,7 +10,7 @@
     const fxWasmIntegrity = "";
     const fxWasmUrl = fxWasmAsset === "./fx-term.wasm" &&
       (location.hostname === "localhost" || location.hostname === "127.0.0.1")
-      ? "../zig-out/bin/fx-term.wasm"
+      ? "../zig-out/bin/omfx-term.wasm"
       : fxWasmAsset;
     globalThis.__fxWasmModule = null;
     if (typeof WebAssembly.Suspending === "function" && typeof WebAssembly.promising === "function") {

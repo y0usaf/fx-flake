@@ -1,4 +1,5 @@
 const std = @import("std");
+const build_options = @import("build_options");
 const app_permission_runtime = @import("../app/app_permission_runtime.zig");
 const app_session_runtime = @import("../app/app_session_runtime.zig");
 const auth_runtime = @import("../auth/auth_runtime.zig");
@@ -21,7 +22,7 @@ const render_request = @import("../../ui/render_request.zig");
 
 const freeStringList = collections.freeStringList;
 const containsIgnoreCase = text_utils.containsIgnoreCase;
-const permissions_usage = "usage: /permissions [ask|auto|yolo|reset]\n       /permissions remember <allow|deny> <tool-name> <arguments-json>\n       /permissions revoke <rule-id>";
+const permissions_usage = "usage: /permissions [ask|auto|full-access|reset]\n       /permissions remember <allow|deny> <tool-name> <arguments-json>\n       /permissions revoke <rule-id>";
 
 pub fn reportUserSettingsCommit(
     app: anytype,
@@ -271,10 +272,20 @@ pub fn Commands(comptime App: type) type {
         }
 
         pub fn showStatus(app: *App) !void {
-            const auth = app.auth.statusSnapshot();
+            const provider = provider_runtime.provider(app);
+            var preferred: ?types.CredentialSource = null;
+            if (provider == .gateway and app.auth.credentialSource() == null) {
+                var settings = config_runtime.loadMergedSettings(app.alloc, app.workspace_root) catch |err| {
+                    try writeSettingsLoadError(app, err);
+                    return;
+                };
+                defer settings.deinit(app.alloc);
+                preferred = settings.credential_source;
+            }
+            const auth = app.auth.statusSnapshot(provider, preferred);
             const text = try (output_contracts.StatusSnapshot{
                 .model = provider_runtime.model(app),
-                .provider = provider_runtime.provider(app),
+                .provider = provider,
                 .update_channel = update_channel_label(app),
                 .build_channel = if (@hasDecl(App, "build_update_channel")) App.build_update_channel.label() else "stable",
                 .build_revision = if (@hasDecl(App, "build_revision")) App.build_revision else "",
@@ -350,21 +361,17 @@ pub fn Commands(comptime App: type) type {
                 return;
             }
 
-            if (std.ascii.eqlIgnoreCase(rest, "ask")) {
-                try app_permission_runtime.Runtime(App).selectMode(app, .ask);
-                try app.writeDomainNotice(.{ .topic = "permissions", .tone = .neutral, .body = "mode set to ask" }, true);
-                return;
-            }
-
-            if (std.ascii.eqlIgnoreCase(rest, "auto")) {
-                try app_permission_runtime.Runtime(App).selectMode(app, .auto);
-                try app.writeDomainNotice(.{ .topic = "permissions", .tone = .neutral, .body = "mode set to auto" }, true);
-                return;
-            }
-
-            if (std.ascii.eqlIgnoreCase(rest, "yolo")) {
-                try app_permission_runtime.Runtime(App).selectMode(app, .yolo);
-                try app.writeDomainNotice(.{ .topic = "permissions", .tone = .warning, .body = "mode set to yolo" }, true);
+            if (config_runtime.parsePermissionMode(rest)) |mode| {
+                try app_permission_runtime.Runtime(App).selectMode(app, mode);
+                try app.writeDomainNotice(.{
+                    .topic = "permissions",
+                    .tone = if (mode == .yolo) .warning else .neutral,
+                    .body = switch (mode) {
+                        .ask => "mode set to ask",
+                        .auto => "mode set to auto",
+                        .yolo => "mode set to full access",
+                    },
+                }, true);
                 return;
             }
 
@@ -933,7 +940,7 @@ pub fn Commands(comptime App: type) type {
             const msg = try std.fmt.allocPrint(app.alloc, "model: {s}\nmodel_config_source: {s}\npermission_mode: {s}\nworkspace: {s}\nstep_limit: {d}\nstartup_scrollback: {s}", .{
                 provider_runtime.model(app),
                 @tagName(detailed.sources.models.get(.gateway)),
-                permissions.permissionModeLabel(app.permission_engine.mode),
+                permissions.permissionModeDisplayLabel(app.permission_engine.mode),
                 app.workspace_root,
                 app.agent_step_limit,
                 startup_scrollback_label,
@@ -1124,8 +1131,6 @@ pub fn Commands(comptime App: type) type {
             const selected = provider_runtime.model(app);
             try app.worker.syncQueuedPromptModel(std.heap.c_allocator, selected);
             if (comptime @hasDecl(App, "persistAcceptedModel")) try app.persistAcceptedModel(selected);
-            // Keep the session or workspace discriminator while updating the
-            // model shown as secondary terminal-tab context.
             app_session_runtime.Runtime(App).syncTerminalTitle(app);
 
             if (announce) {
@@ -1921,6 +1926,12 @@ fn writeFixtureFile(dir: std.Io.Dir, sub_path: []const u8, text: []const u8) !vo
 
 test "session_commands showStatus writes session status snapshot" {
     const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(home_root);
+    const env = try SessionCommandTestHome.install(alloc, home_root);
+    defer env.deinit();
     var app = try FakeApp.init(alloc, "/tmp/workspace", "anthropic/test-model");
     defer app.deinit();
     app.permission_engine.mode = .auto;
@@ -1938,7 +1949,7 @@ test "session_commands showStatus writes session status snapshot" {
     app.clearTranscript();
     app.permission_engine.mode = .yolo;
     try Commands(FakeApp).showStatus(&app);
-    try expectTranscriptContains(&app, "permission_mode=yolo\n");
+    try expectTranscriptContains(&app, "permission_mode=full access\n");
 }
 
 test "session_commands history setting toggles durable input history" {
@@ -2197,7 +2208,7 @@ test "session_commands handleModel resolves fuzzy cached model and syncs queued 
     try std.testing.expectEqualStrings("anthropic/claude-sonnet-4-20250514", app.worker.synced_model.?);
     try std.testing.expectEqual(model_provider.ProviderId.codex, app.last_preference_provider.?);
     try std.testing.expectEqualStrings(
-        "workspace · anthropic/claude-sonnet-4-20250514",
+        "v" ++ build_options.app_version ++ " | workspace",
         app.terminalTitleLabelText(),
     );
     try expectTranscriptContains(&app, "● Switched to anthropic/claude-sonnet-4-20250514");
@@ -2214,7 +2225,7 @@ test "session_commands handleModel falls back to raw query when model fetch fail
     try std.testing.expectEqualStrings("custom/provider-model", app.selected_model.items);
     try std.testing.expectEqualStrings("custom/provider-model", app.worker.synced_model.?);
     try std.testing.expectEqualStrings(
-        "workspace · custom/provider-model",
+        "v" ++ build_options.app_version ++ " | workspace",
         app.terminalTitleLabelText(),
     );
 }
@@ -2238,7 +2249,7 @@ test "session_commands handlePermissions persists modes and reset clears session
     try std.testing.expectEqual(types.PermissionMode.yolo, app.worker.synced_mode.?);
     try std.testing.expectEqual(@as(usize, 2), app.permission_mode_preference_commit_count);
     try std.testing.expectEqual(@as(?types.PermissionMode, .yolo), app.last_preference_permission_mode);
-    try expectTranscriptContains(&app, "mode set to yolo");
+    try expectTranscriptContains(&app, "mode set to full access");
 
     app.clearTranscript();
     try Commands(FakeApp).handlePermissions(&app, "ask");
@@ -2291,11 +2302,11 @@ test "session_commands handlePermissions reports usage and invalid action before
     defer app.deinit();
 
     try Commands(FakeApp).handlePermissions(&app, "add");
-    try expectTranscriptContains(&app, "usage: /permissions [ask|auto|yolo|reset]");
+    try expectTranscriptContains(&app, "usage: /permissions [ask|auto|full-access|reset]");
 
     app.clearTranscript();
     try Commands(FakeApp).handlePermissions(&app, "remove");
-    try expectTranscriptContains(&app, "usage: /permissions [ask|auto|yolo|reset]");
+    try expectTranscriptContains(&app, "usage: /permissions [ask|auto|full-access|reset]");
     try std.testing.expectEqual(@as(usize, 0), app.permission_mode_preference_commit_count);
 }
 
@@ -2750,7 +2761,7 @@ test "session_commands model picker accepts the current selected model slice" {
     try std.testing.expectEqualStrings("anthropic/claude-opus-4.6", app.worker.synced_model.?);
     try std.testing.expectEqualStrings("anthropic/claude-opus-4.6", app.last_preference_model.items);
     try std.testing.expectEqualStrings(
-        "workspace · anthropic/claude-opus-4.6",
+        "v" ++ build_options.app_version ++ " | workspace",
         app.terminalTitleLabelText(),
     );
     try std.testing.expectEqual(types.ReasoningEffort.literal("high"), app.effort);

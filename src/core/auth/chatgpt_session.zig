@@ -22,6 +22,10 @@ pub fn presence() host.SecretStorePresence {
     return session_presence.profileFile(auth_file_name, max_auth_file_bytes);
 }
 
+pub fn requireSignInStorage() error{CredentialStorageUnavailable}!void {
+    _ = try session_presence.requireWritableProfileFile(auth_file_name, mutation_lock_file_name);
+}
+
 pub fn refreshDeadlineMs(expires_at_ms: i64) i64 {
     return @max(expires_at_ms - expiry_skew_ms, 0);
 }
@@ -54,6 +58,10 @@ pub const Mutation = struct {
     fx_dir: io_mod.VerifiedDir,
     lock: io_mod.TimedAdvisoryLock,
 
+    pub fn requireWritable(self: *Mutation) error{CredentialStorageUnavailable}!void {
+        _ = try session_presence.requireWritableInDir(self.fx_dir.dir, auth_file_name);
+    }
+
     pub fn deinit(self: *Mutation) void {
         self.lock.release();
         self.fx_dir.close();
@@ -61,7 +69,7 @@ pub const Mutation = struct {
     }
 
     pub fn load(self: *Mutation, alloc: Allocator) !?Session {
-        return loadFromDir(alloc, &self.fx_dir.dir, true);
+        return loadFromDir(alloc, &self.fx_dir.dir);
     }
 
     pub fn save(self: *Mutation, alloc: Allocator, session: Session) !void {
@@ -86,7 +94,8 @@ pub fn load(alloc: Allocator) !?Session {
     const home = io_mod.getenv("HOME") orelse return null;
     var home_dir = std.Io.Dir.openDirAbsolute(io_mod.getIo(), home, .{ .iterate = true }) catch |err| {
         debug_trace.logf("auth", "ChatGPT session load failed step=open_home err={s}", .{@errorName(err)});
-        return null;
+        if (err == error.FileNotFound) return null;
+        return session_presence.storageError(auth_file_name, err);
     };
     defer home_dir.close(io_mod.getIo());
 
@@ -97,13 +106,14 @@ pub fn load(alloc: Allocator) !?Session {
         if (err != error.FileNotFound) {
             debug_trace.logf("auth", "ChatGPT session load failed step=open_profile err={s}", .{@errorName(err)});
         }
-        return null;
+        if (err == error.FileNotFound) return null;
+        return session_presence.storageError(auth_file_name, err);
     };
     defer fx_dir.close(io_mod.getIo());
-    return loadFromDir(alloc, &fx_dir, false);
+    return loadFromDir(alloc, &fx_dir);
 }
 
-fn loadFromDir(alloc: Allocator, fx_dir: *std.Io.Dir, report_open_failure: bool) !?Session {
+fn loadFromDir(alloc: Allocator, fx_dir: *std.Io.Dir) !?Session {
     var file = fx_dir.openFile(io_mod.getIo(), auth_file_name, .{
         .mode = .read_only,
         .allow_directory = false,
@@ -113,25 +123,24 @@ fn loadFromDir(alloc: Allocator, fx_dir: *std.Io.Dir, report_open_failure: bool)
         error.FileNotFound => return null,
         else => {
             debug_trace.logf("auth", "ChatGPT session load failed step=open_file err={s}", .{@errorName(err)});
-            if (report_open_failure) return err;
-            return null;
+            return session_presence.storageError(auth_file_name, err);
         },
     };
     defer file.close(io_mod.getIo());
 
-    const stat = try file.stat(io_mod.getIo());
-    if (stat.kind != .file or stat.permissions.toMode() & 0o077 != 0) {
+    const stat = file.stat(io_mod.getIo()) catch |err| return session_presence.storageError(auth_file_name, err);
+    if (stat.kind != .file or stat.nlink != 1 or stat.permissions.toMode() & 0o077 != 0) {
         debug_trace.logf("auth", "ChatGPT session load failed step=permissions err=InsecureAuthFile", .{});
-        return null;
+        return error.InsecureAuthFile;
     }
 
-    const bytes = try io_mod.readFileToEnd(alloc, &file, max_auth_file_bytes);
+    const bytes = io_mod.readFileToEnd(alloc, &file, max_auth_file_bytes) catch |err| return session_presence.storageError(auth_file_name, err);
     defer secret.zeroAndFree(alloc, bytes);
     return parse(alloc, bytes) catch |err| switch (err) {
         error.OutOfMemory => return err,
         else => {
             debug_trace.logf("auth", "ChatGPT session load failed step=parse err={s}", .{@errorName(err)});
-            return null;
+            return error.InvalidChatGptAuthSession;
         },
     };
 }
@@ -147,13 +156,13 @@ pub fn beginExistingMutation() !?Mutation {
     if (comptime host_target.is_wasm) return null;
     const home = io_mod.getenv("HOME") orelse return error.HomeNotSet;
     var home_dir = io_mod.VerifiedDir{
-        .dir = try std.Io.Dir.openDirAbsolute(io_mod.getIo(), home, .{ .iterate = true }),
+        .dir = std.Io.Dir.openDirAbsolute(io_mod.getIo(), home, .{ .iterate = true }) catch |err| return session_presence.storageError(auth_file_name, err),
     };
     defer home_dir.close();
 
     const fx_dir = openExistingPrivateFxDir(&home_dir) catch |err| switch (err) {
         error.FileNotFound => return null,
-        else => return err,
+        else => return session_presence.storageError(auth_file_name, err),
     };
     return try lockMutation(fx_dir);
 }
@@ -161,7 +170,7 @@ pub fn beginExistingMutation() !?Mutation {
 fn beginMutation() !Mutation {
     const home = io_mod.getenv("HOME") orelse return error.HomeNotSet;
     var home_dir = io_mod.VerifiedDir{
-        .dir = try std.Io.Dir.openDirAbsolute(io_mod.getIo(), home, .{ .iterate = true }),
+        .dir = std.Io.Dir.openDirAbsolute(io_mod.getIo(), home, .{ .iterate = true }) catch |err| return session_presence.storageError(auth_file_name, err),
     };
     defer home_dir.close();
 
@@ -172,11 +181,11 @@ fn beginMutation() !Mutation {
 fn lockMutation(open_fx_dir: io_mod.VerifiedDir) !Mutation {
     var fx_dir = open_fx_dir;
     errdefer fx_dir.close();
-    var lock = try io_mod.acquireTimedAdvisoryLock(
+    var lock = io_mod.acquireTimedAdvisoryLock(
         &fx_dir,
         mutation_lock_file_name,
         mutation_lock_deadline_ms,
-    );
+    ) catch |err| return session_presence.storageError(auth_file_name, err);
     errdefer lock.release();
     return .{ .fx_dir = fx_dir, .lock = lock };
 }

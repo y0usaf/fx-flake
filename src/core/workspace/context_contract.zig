@@ -1,5 +1,4 @@
 const std = @import("std");
-const change_tracker = @import("change_tracker.zig");
 const types = @import("../shared/types.zig");
 const context_limits = @import("../config/context_limits.zig");
 const workspace_access = @import("workspace_access.zig");
@@ -250,7 +249,6 @@ pub const TransientContextInput = struct {
     access_scope: ?workspace_access.AccessScope = null,
     interactive: bool,
     permission_mode: types.PermissionMode,
-    tracker: ?*change_tracker.ChangeTracker,
 };
 
 pub const Provider = struct {
@@ -275,6 +273,22 @@ pub const Provider = struct {
     pub fn appendTransient(self: Provider, input: TransientContextInput, alloc: Allocator, messages: *std.ArrayList(types.ChatMessage)) ProviderError!void {
         return self.append_transient_fn(input, alloc, messages);
     }
+};
+
+fn gather_empty_context(_: Allocator, _: InitialContextInput) ProviderError!ProviderContext {
+    return .{};
+}
+
+fn append_no_context(_: StaticContextInput, _: Allocator, _: *std.ArrayList(types.ChatMessage)) ProviderError!void {}
+
+fn append_no_transient_context(_: TransientContextInput, _: Allocator, _: *std.ArrayList(types.ChatMessage)) ProviderError!void {}
+
+pub const empty_provider = Provider{
+    .id = "core.empty_context",
+    .gather_project_context_fn = gather_empty_context,
+    .select_applicable_project_context_fn = selectNoApplicableProjectContext,
+    .append_static_fn = append_no_context,
+    .append_transient_fn = append_no_transient_context,
 };
 
 pub fn selectNoApplicableProjectContext(_: Allocator, _: LaterContextInput) ProviderError!ProviderContext {
@@ -758,8 +772,6 @@ test "context registry routes the default provider" {
     defer snapshot.deinit(alloc);
     const contribution = snapshot.contribution orelse return error.TestExpectedEqual;
 
-    var tracker: change_tracker.ChangeTracker = .{};
-    defer tracker.deinit(alloc);
     var arena_state = std.heap.ArenaAllocator.init(alloc);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -771,7 +783,6 @@ test "context registry routes the default provider" {
         .workspace_root = "/workspace",
         .interactive = true,
         .permission_mode = .ask,
-        .tracker = &tracker,
     }, arena, &messages);
 
     try std.testing.expectEqual(@as(usize, 2), messages.items.len);

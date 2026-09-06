@@ -713,6 +713,22 @@ pub const Runtime = struct {
         return entry.backend();
     }
 
+    /// Copies retained captured-command metadata without reserving output or changing authority.
+    /// The caller owns the returned bytes. Missing and TTY executions return null.
+    pub fn captured_command_alloc(
+        self: *Runtime,
+        alloc: Allocator,
+        execution_id: []const u8,
+    ) Allocator.Error!?[]u8 {
+        const entry = self.acquireEntry(execution_id) orelse return null;
+        defer self.releaseEntry(entry);
+        const zio = io_mod.getIo();
+        entry.mutex.lockUncancelable(zio);
+        defer entry.mutex.unlock(zio);
+        if (entry.backend() != .captured) return null;
+        return try alloc.dupe(u8, entry.command);
+    }
+
     pub fn stateFor(
         self: *Runtime,
         execution_id: []const u8,
@@ -1588,6 +1604,13 @@ test "captured managed execution yields one handle and delivers ordered output o
     var started = try runtime.startCaptured(alloc, input);
     defer started.deinit(alloc);
     try std.testing.expectEqual(SnapshotState.running, started.snapshot.state);
+    try std.testing.expectEqual(@as(?[]u8, null), try runtime.captured_command_alloc(alloc, "missing"));
+    var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
+    try std.testing.expectError(error.OutOfMemory, runtime.captured_command_alloc(failing.allocator(), input.execution_id));
+    const command = (try runtime.captured_command_alloc(alloc, input.execution_id)).?;
+    defer alloc.free(command);
+    try std.testing.expectEqualStrings(input.command, command);
+    command[0] = 'P';
     try runtime.commitDelivery(started.snapshot.execution_id, started.reservation_id);
 
     var completed = try runtime.wait(alloc, input.execution_id, 2_000, null);
@@ -1605,6 +1628,10 @@ test "captured managed execution yields one handle and delivers ordered output o
     defer repeated.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 0), repeated.snapshot.output_delta.len);
     try runtime.commitDelivery(repeated.snapshot.execution_id, repeated.reservation_id);
+    const retained_command = (try runtime.captured_command_alloc(alloc, input.execution_id)).?;
+    defer alloc.free(retained_command);
+    try std.testing.expectEqualStrings(input.command, retained_command);
+    try std.testing.expect(runtime.isTombstone(input.execution_id));
 }
 
 test "captured stop returns lost when its worker cannot settle" {
@@ -2035,6 +2062,7 @@ test "TTY cursor advances monotonically and delivers each delta once" {
         started.snapshot.execution_id,
         started.reservation_id,
     );
+    try std.testing.expectEqual(@as(?[]u8, null), try runtime.captured_command_alloc(alloc, "tty-cursor"));
 
     try runtime.refreshTty(.{
         .execution_id = "tty-cursor",

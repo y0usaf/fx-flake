@@ -22,7 +22,7 @@ const options = {
   backend,
   nativeAddon: resolve(scriptDir, "../../zig-out/lib/libfx.node"),
   ...(backend === "wasm"
-    ? { wasm: await readFile(resolve(scriptDir, "../../zig-out/bin/fx-core.wasm")) }
+    ? { wasm: await readFile(resolve(scriptDir, "../../zig-out/bin/omfx-core.wasm")) }
     : {}),
   apiKey: "instruction-limit-test-key",
 };

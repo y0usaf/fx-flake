@@ -680,6 +680,55 @@ fn activateProviderSelection(
     caller: ProviderActivationCaller,
     exact_source: ?credentials.Source,
 ) !bool {
+    return activateProviderSelectionFallible(alloc, cfg, deps, target, caller, exact_source) catch |err| {
+        switch (err) {
+            error.CredentialStorageUnavailable,
+            error.CredentialTemporarilyUnavailable,
+            error.CredentialRefreshPersistenceUncertain,
+            error.CredentialAuthorityChanged,
+            => {},
+            else => return err,
+        }
+        const detail = try auth_runtime.preparationFailureText(alloc, target, err);
+        defer alloc.free(detail);
+        try writeProviderActivationError(alloc, deps, caller, detail);
+        return false;
+    };
+}
+
+fn runProviderLogin(alloc: Allocator, cfg: Config, provider: model_provider.ProviderId) !void {
+    switch (provider) {
+        .gateway => try login_flow.runLogin(alloc, cfg.gateway_provider.oauth_transport, cfg.url_opener),
+        .codex => try chatgpt_oauth.runLogin(alloc, cfg.gateway_provider.oauth_transport, cfg.url_opener),
+        .grok => try grok_oauth.runLogin(alloc, cfg.gateway_provider.oauth_transport, cfg.url_opener),
+    }
+}
+
+fn writeProviderLoginFailure(alloc: Allocator, deps: RunDeps, provider: model_provider.ProviderId, caller: ProviderActivationCaller, err: anyerror) !void {
+    debug_trace.logf("auth", "provider sign-in failed provider={t} err={s}", .{ provider, @errorName(err) });
+    const failure = auth_runtime.classifyCredentialFailure(provider_catalog.find(provider).login_source, err);
+    if (failure.reason == .invalid_storage or failure.reason == .persistence_uncertain) {
+        const detail = try auth_runtime.preparationFailureText(alloc, provider, err);
+        defer alloc.free(detail);
+        try writeProviderActivationError(alloc, deps, caller, detail);
+        return;
+    }
+    try writeProviderActivationError(alloc, deps, caller, switch (err) {
+        error.ClientIdMissing => "missing FX_OAUTH_CLIENT_ID; configure the fx Vercel App client id first",
+        error.AccessDenied, error.ChatGptAuthorizationFailed, error.GrokAuthorizationFailed => "authorization denied",
+        error.ExpiredToken, error.LoginTimedOut, error.ChatGptLoginTimedOut, error.GrokLoginTimedOut => "authorization expired; run fx login again",
+        else => "failed to sign in",
+    });
+}
+
+fn activateProviderSelectionFallible(
+    alloc: Allocator,
+    cfg: Config,
+    deps: RunDeps,
+    target: model_provider.ProviderId,
+    caller: ProviderActivationCaller,
+    exact_source: ?credentials.Source,
+) !bool {
     const workspace_root = try io_mod.realpathAlloc(alloc, ".");
     defer alloc.free(workspace_root);
     var settings = config_runtime.loadMergedSettings(alloc, workspace_root) catch |err| {
@@ -715,28 +764,12 @@ fn activateProviderSelection(
     }
 
     var performed_login: ?model_provider.ProviderId = null;
-    if (cfg.auth_mode == .local and prepared_credential == null and target == .codex and caller == .provider_command) {
-        chatgpt_oauth.runLogin(alloc, cfg.gateway_provider.oauth_transport, cfg.url_opener) catch |err| {
-            debug_trace.logf("auth", "provider selection Codex login failed err={s}", .{@errorName(err)});
-            try writeProviderActivationError(alloc, deps, caller, "Codex login failed");
+    if (cfg.auth_mode == .local and prepared_credential == null and provider_catalog.find(target).subscription and caller == .provider_command) {
+        runProviderLogin(alloc, cfg, target) catch |err| {
+            try writeProviderLoginFailure(alloc, deps, target, caller, err);
             return false;
         };
-        performed_login = .codex;
-        prepared_credential = try auth_runtime.prepareCredential(
-            alloc,
-            cfg.gateway_provider.oauth_transport,
-            cfg.secret_store,
-            target,
-            preferred_source,
-        );
-    }
-    if (cfg.auth_mode == .local and prepared_credential == null and target == .grok and caller == .provider_command) {
-        grok_oauth.runLogin(alloc, cfg.gateway_provider.oauth_transport, cfg.url_opener) catch |err| {
-            debug_trace.logf("auth", "provider selection Grok login failed err={s}", .{@errorName(err)});
-            try writeProviderActivationError(alloc, deps, caller, "Grok login failed");
-            return false;
-        };
-        performed_login = .grok;
+        performed_login = target;
         prepared_credential = try auth_runtime.prepareCredential(
             alloc,
             cfg.gateway_provider.oauth_transport,
@@ -969,68 +1002,23 @@ fn runNonInteractiveWithDeps(
             }
             // Preserve the original `fx login` behavior for scripts and users.
             const login_provider = maybe_login_provider orelse .gateway;
-            switch (login_provider) {
-                .gateway => {
-                    login_flow.runLogin(
-                        alloc,
-                        cfg.gateway_provider.oauth_transport,
-                        cfg.url_opener,
-                    ) catch |err| {
-                        const message = switch (err) {
-                            error.ClientIdMissing => "fx login: missing FX_OAUTH_CLIENT_ID; configure the fx Vercel App client id first\n",
-                            error.AccessDenied => "fx login: authorization denied\n",
-                            error.ExpiredToken, error.LoginTimedOut => "fx login: authorization expired; run fx login again\n",
-                            else => "fx login: failed to sign in\n",
-                        };
-                        try writeStderr(deps, message);
-                        return .handled_failure;
-                    };
-                    if (!try activateProviderSelection(
-                        alloc,
-                        cfg,
-                        deps,
-                        .gateway,
-                        .provider_login,
-                        .fx_login,
-                    )) return .handled_failure;
-                    try writeStdout(deps, "Signed in to Vercel.\n");
-                    try writeStdout(deps, "AI Gateway access may still require billing or API setup for the selected account.\n");
-                },
-                .codex => {
-                    chatgpt_oauth.runLogin(
-                        alloc,
-                        cfg.gateway_provider.oauth_transport,
-                        cfg.url_opener,
-                    ) catch |err| {
-                        const message = switch (err) {
-                            error.ChatGptLoginTimedOut => "fx login: Codex authorization expired; run fx login codex again\n",
-                            error.ChatGptAuthorizationFailed => "fx login: Codex authorization denied\n",
-                            else => "fx login: failed to sign in with Codex\n",
-                        };
-                        try writeStderr(deps, message);
-                        return .handled_failure;
-                    };
-                    if (!try activateProviderSelection(alloc, cfg, deps, .codex, .provider_login, null)) {
-                        return .handled_failure;
-                    }
-                    try writeStdout(deps, "Signed in with Codex.\n");
-                },
-                .grok => {
-                    grok_oauth.runLogin(
-                        alloc,
-                        cfg.gateway_provider.oauth_transport,
-                        cfg.url_opener,
-                    ) catch |err| {
-                        debug_trace.logf("auth", "Grok login failed err={s}", .{@errorName(err)});
-                        try writeStderr(deps, "fx login: failed to sign in with Grok\n");
-                        return .handled_failure;
-                    };
-                    if (!try activateProviderSelection(alloc, cfg, deps, .grok, .provider_login, null)) {
-                        return .handled_failure;
-                    }
-                    try writeStdout(deps, "Signed in with Grok.\n");
-                },
-            }
+            runProviderLogin(alloc, cfg, login_provider) catch |err| {
+                try writeProviderLoginFailure(alloc, deps, login_provider, .provider_login, err);
+                return .handled_failure;
+            };
+            if (!try activateProviderSelection(
+                alloc,
+                cfg,
+                deps,
+                login_provider,
+                .provider_login,
+                if (login_provider == .gateway) .fx_login else null,
+            )) return .handled_failure;
+            try writeStdout(deps, switch (login_provider) {
+                .gateway => "Signed in to Vercel.\nAI Gateway access may still require billing or API setup for the selected account.\n",
+                .codex => "Signed in with Codex.\n",
+                .grok => "Signed in with Grok.\n",
+            });
             return .handled_success;
         },
         .logout => |rest| {
@@ -2234,8 +2222,10 @@ fn runTopLevelMcp(
     deps: RunDeps,
 ) !RunResult {
     if (rest.len == 0) {
-        try writeTopLevelUsage(cfg.command_catalog, deps, .mcp);
-        return .handled_failure;
+        const help = try command_specs.renderTopLevelCommandHelp(alloc, cfg.command_catalog, .mcp);
+        defer alloc.free(help);
+        try writeStdout(deps, help);
+        return .handled_success;
     }
     const operation = rest[0];
     if (std.mem.eql(u8, operation, "add")) {
@@ -2373,7 +2363,7 @@ fn runTopLevelMcp(
     }
     if (std.mem.eql(u8, operation, "auth")) {
         if (rest.len != 2 or rest[1].len == 0) {
-            try writeTopLevelUsage(cfg.command_catalog, deps, .mcp);
+            try writeStderr(deps, "usage: fx " ++ command_specs.mcp_auth_usage ++ "\n");
             return .handled_failure;
         }
         var loaded = loadMcpCommandRuntime(alloc, cfg, deps) catch |err| {
@@ -2386,7 +2376,7 @@ fn runTopLevelMcp(
             try writeMcpOperationFailure(alloc, deps, "auth", error.McpServerNotFound);
             return .handled_failure;
         };
-        var opener = cfg.url_opener;
+        var opener = McpCliAuthorization{ .opener = cfg.url_opener, .deps = deps };
         var result = runtime.authenticateServer(
             rest[1],
             &opener,
@@ -2529,13 +2519,26 @@ fn writeMcpTrustSuccess(
     try writeStdout(deps, out.written());
 }
 
+const McpCliAuthorization = struct {
+    opener: host.UrlOpener,
+    deps: RunDeps,
+};
+
 fn openTopLevelMcpUrl(
     raw: ?*anyopaque,
     alloc: Allocator,
     url: []const u8,
 ) anyerror!bool {
-    const opener: *const host.UrlOpener = @ptrCast(@alignCast(raw.?));
-    return opener.open(alloc, url);
+    const presentation: *const McpCliAuthorization = @ptrCast(@alignCast(raw.?));
+    var encoded_url = try text_utils.encodeTerminalSafe(alloc, url, std.math.maxInt(usize));
+    defer encoded_url.deinit(alloc);
+    try writeStdout(presentation.deps, "Open this URL to authenticate the MCP server:\n");
+    try writeStdout(presentation.deps, encoded_url.bytes);
+    try writeStdout(presentation.deps, "\n\nWaiting for browser authorization...\n");
+    if (io_mod.getenv("FX_NO_OPEN_BROWSER") == null) {
+        _ = try presentation.opener.open(alloc, url);
+    }
+    return true;
 }
 
 fn writeMcpProfileMutationSuccess(
@@ -2908,7 +2911,7 @@ fn writeLookupFailure(
         error.SessionRecoveryRequiresCurrentSchema => {
             try writeStderr(
                 deps,
-                "fx session: recovery only applies to current schema-v3 sessions; migrate legacy sessions first\n",
+                "fx session: recovery supports conversation logs and schema-v3 event logs; migrate snapshot sessions first\n",
             );
         },
         error.SessionRecoveryUnsupportedSchema => {
@@ -3039,7 +3042,7 @@ fn lookupFailureMessage(err: anyerror) ?[]const u8 {
         error.LegacySessionMigrationFailed, error.LegacySessionChanged => "migration did not complete; the original session remains authoritative",
         error.LegacySessionMigrationIndeterminate => "migration outcome is indeterminate and will be resolved by the next exact writable load",
         error.SessionRecoveryNotNeeded => "recovery was refused because the session has a valid commit boundary; resume it normally",
-        error.SessionRecoveryRequiresCurrentSchema => "recovery only applies to current schema-v3 sessions; migrate legacy sessions first",
+        error.SessionRecoveryRequiresCurrentSchema => "recovery supports conversation logs and schema-v3 event logs; migrate snapshot sessions first",
         error.SessionRecoveryUnsupportedSchema => "recovery is unavailable for this unsupported session version",
         error.SessionRecoveryBoundaryInvalid => "no exact trustworthy recovery boundary was found; the source was left unchanged",
         error.SessionRecoveryIndeterminate => "the recovery copy could not be confirmed; the source was left unchanged",

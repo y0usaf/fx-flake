@@ -383,6 +383,79 @@ describe("fx ask presentation", () => {
     expect(result.stderr).toContain("Reading fixture.txt");
   }, TIMEOUT);
 
+  test("tool recovery keeps progress updates ordered before the final response", async () => {
+    const root = createRoot();
+    writeFileSync(join(root.workspace, "fallback.txt"), "fallback contents\n");
+    const initial = "I will inspect the requested file first.";
+    const recovery = "The requested file was missing, so I will inspect fallback.txt next.";
+    const final = "The fallback inspection is complete.";
+    const gateway = startFakeGateway([
+      fakeGatewaySerializedToolCall(
+        "read_missing_for_progress",
+        "read_file",
+        JSON.stringify({ path: "missing.txt" }),
+        initial,
+      ),
+      fakeGatewaySerializedToolCall(
+        "read_fallback_for_progress",
+        "read_file",
+        JSON.stringify({ path: "fallback.txt" }),
+        recovery,
+      ),
+      fakeGatewayFinalText(final),
+    ]);
+    gateways.push(gateway);
+
+    const result = await runFx(
+      ["ask", "--json", "--auto", "--no-save", "Inspect missing.txt and recover with fallback.txt."],
+      {
+        cwd: root.workspace,
+        env: gatewayEnv(root.home, gateway),
+        timeoutMs: TIMEOUT,
+      },
+    );
+
+    expect(result.code).toBe(0);
+    expect(gateway.requests).toHaveLength(3);
+    const firstPrompt = (JSON.parse(gateway.requests[0]!.body) as GatewayRequestBody)
+      .prompt
+      .filter((message) => message.role === "system")
+      .map((message) => typeof message.content === "string" ? message.content : "")
+      .join("\n");
+    expect(firstPrompt).toContain(
+      "Before the first tool call in a tool-driven task, always send one brief user-visible update",
+    );
+    expect(firstPrompt).toContain("Never start the first tool silently.");
+    expect(firstPrompt).toContain(
+      "If another tool call will follow, always first tell the user what failed",
+    );
+    expect(firstPrompt).toContain("Do not narrate each routine tool call.");
+
+    const output = JSON.parse(result.stdout) as {
+      output: string;
+      final_output: string;
+      tool_calls: Array<{ name: string; status: string }>;
+    };
+    expect(output.output).toContain(initial);
+    expect(output.output).toContain(recovery);
+    expect(output.output).toContain(final);
+    expect(output.output.indexOf(initial)).toBeLessThan(
+      output.output.indexOf(recovery),
+    );
+    expect(output.output.indexOf(recovery)).toBeLessThan(
+      output.output.indexOf(final),
+    );
+    expect(output.final_output).toBe(final);
+    expect(output.tool_calls).toEqual([
+      { name: "read_file", status: "error" },
+      { name: "read_file", status: "success" },
+    ]);
+    expect(gateway.requests[1]!.body).toContain("FileNotFound");
+    expect(gateway.requests[2]!.body).toContain(recovery);
+    expect(result.stderr).toContain("Reading missing.txt");
+    expect(result.stderr).toContain("Reading fallback.txt");
+  }, TIMEOUT);
+
   test.skipIf(!tmuxAvailable())(
     "TTY stdout uses the Minimal transcript and compact tool group",
     async () => {

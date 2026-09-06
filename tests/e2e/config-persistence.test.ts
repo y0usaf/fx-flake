@@ -1377,9 +1377,9 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
         expect(JSON.parse(gateway.requests[1]!.body)).toMatchObject({
           reasoning: "future-tier",
         });
-        expect(JSON.parse(gateway.requests[1]!.body)).not.toHaveProperty(
-          "providerOptions",
-        );
+        expect(JSON.parse(gateway.requests[1]!.body).providerOptions).toEqual({
+          gateway: { caching: "auto" },
+        });
 
         await session.sendText("/quit");
         await session.waitForSessionEnd(TIMEOUT);

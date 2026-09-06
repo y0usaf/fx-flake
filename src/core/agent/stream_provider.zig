@@ -131,6 +131,7 @@ pub const DynamicFunctionTool = struct {
     name: []const u8,
     description: []const u8,
     input_schema: std.json.Value,
+    mcp_binding: ?types.McpToolBinding = null,
 };
 
 pub const ToolSelection = struct {
@@ -162,6 +163,7 @@ test "host-managed credential lease exposes no secret or account metadata" {
 /// Every slice and JSON value is borrowed for the call.
 pub const RequestData = struct {
     model: []const u8,
+    instructions: []const types.ChatMessage = &.{},
     messages: []const types.ChatMessage,
     tools: ToolSelection = .{},
     tool_choice: types.ToolChoice,
@@ -171,7 +173,35 @@ pub const RequestData = struct {
     budget: ?BuildBudget = null,
     verified_images: ?[]const image_attachments.VerifiedSnapshot = null,
     response_format: ?StructuredResponseFormat = null,
+
+    pub fn validatePrompt(self: RequestData) error{InvalidProviderPrompt}!void {
+        try validate_prompt_lanes(self.instructions, self.messages);
+    }
 };
+
+pub fn validate_prompt_lanes(
+    instructions: []const types.ChatMessage,
+    messages: []const types.ChatMessage,
+) error{InvalidProviderPrompt}!void {
+    for (instructions) |instruction| {
+        if (instruction.role != .system or
+            instruction.content == null or
+            instruction.images.len != 0 or
+            instruction.tool_call_id != null or
+            instruction.tool_name != null or
+            instruction.tool_calls.len != 0 or
+            instruction.provider_replay != null or
+            instruction.tool_result_status != null or
+            instruction.tool_result_memory != null or
+            instruction.permission_feedback)
+        {
+            return error.InvalidProviderPrompt;
+        }
+    }
+    for (messages) |message| {
+        if (message.role == .system) return error.InvalidProviderPrompt;
+    }
+}
 
 /// Borrowed typed request. Providers own validation, wire serialization,
 /// endpoint selection, headers, HTTP, and stream reduction.
@@ -180,6 +210,7 @@ pub const ModelRequest = struct {
     session_id: ?[]const u8 = null,
     model: []const u8,
     retry_count: usize,
+    instructions: []const types.ChatMessage = &.{},
     messages: []const types.ChatMessage,
     tools: ToolSelection = .{},
     tool_choice: types.ToolChoice,
@@ -208,6 +239,7 @@ pub const ModelRequest = struct {
     pub fn data(self: ModelRequest) RequestData {
         return .{
             .model = self.model,
+            .instructions = self.instructions,
             .messages = self.messages,
             .tools = self.tools,
             .tool_choice = self.tool_choice,
@@ -337,8 +369,18 @@ pub const Provider = struct {
     stream_fn: StreamFn,
     /// Optional exact provider serializer used for request-capacity decisions.
     build_request_fn: ?BuildRequestFn = null,
+    /// Pure provider-owned slicing when one reply becomes separate history units.
+    project_replay_fn: ?*const fn (Allocator, ?types.ProviderReplay, []const types.ToolCall, bool, bool) anyerror!?types.ProviderReplay = null,
+
+    /// Borrows unchanged payloads; projected payloads live in the caller's arena.
+    pub fn projectReplay(self: Provider, arena: Allocator, replay: ?types.ProviderReplay, calls: []const types.ToolCall, text: bool, reasoning: bool) !?types.ProviderReplay {
+        if (replay == null) return null;
+        const project = self.project_replay_fn orelse return error.ProviderReplayProjectionUnavailable;
+        return project(arena, replay, calls, text, reasoning);
+    }
 
     pub fn stream(self: Provider, alloc: Allocator, request: ModelRequest) !Result {
+        try request.data().validatePrompt();
         return self.stream_fn(self.context, alloc, request);
     }
 
@@ -349,6 +391,7 @@ pub const Provider = struct {
         alloc: Allocator,
         request: RequestData,
     ) !?[]u8 {
+        try request.validatePrompt();
         const build = self.build_request_fn orelse return null;
         return try build(self.context, alloc, request);
     }
@@ -366,11 +409,13 @@ test "stream provider accepts one typed request and emits ordered neutral events
     const Fake = struct {
         calls: usize = 0,
         attempt_owner: ?ProviderAttemptOwner = null,
+        instruction_count: usize = 0,
 
         fn stream(raw: ?*anyopaque, _: Allocator, request: ModelRequest) anyerror!Result {
             const self: *@This() = @ptrCast(@alignCast(raw.?));
             self.calls += 1;
             self.attempt_owner = request.provider_attempt_owner;
+            self.instruction_count = request.instructions.len;
             try request.admission.admit();
             request.events.emit(.{ .content_delta = "first" });
             request.events.emit(.{ .reasoning_delta = "second" });
@@ -412,6 +457,7 @@ test "stream provider accepts one typed request and emits ordered neutral events
     var delivery = DeliveryCertainty.init();
     var attempt_evidence: AttemptEvidence = .{};
     var cancelled = std.atomic.Value(bool).init(false);
+    const instructions = [_]types.ChatMessage{.{ .role = .system, .content = "rules" }};
     var result = try (Provider{
         .context = &fake,
         .stream_fn = Fake.stream,
@@ -419,6 +465,7 @@ test "stream provider accepts one typed request and emits ordered neutral events
         .credential = .{ .direct = .{ .secret_bytes = "key" } },
         .model = "model",
         .retry_count = 1,
+        .instructions = &instructions,
         .messages = &.{},
         .tools = .{},
         .tool_choice = .auto,
@@ -437,11 +484,54 @@ test "stream provider accepts one typed request and emits ordered neutral events
 
     try std.testing.expectEqual(@as(usize, 1), fake.calls);
     try std.testing.expectEqual(@as(usize, 1), admission_capture.calls);
+    try std.testing.expectEqual(@as(usize, 1), fake.instruction_count);
     try std.testing.expectEqual(ProviderAttemptOwner.agent, fake.attempt_owner.?);
     try std.testing.expect(!capture.failed);
     try std.testing.expectEqualStrings("firstsecond", capture.chunks.items);
     try std.testing.expectEqualStrings("done", result.completed.completion.content.?);
     try std.testing.expect(std.meta.activeTag(result.completed.usage) == .exact);
+}
+
+test "stream provider rejects system messages in conversation before delegation" {
+    const Fake = struct {
+        calls: usize = 0,
+
+        fn stream(raw: ?*anyopaque, _: Allocator, _: ModelRequest) anyerror!Result {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.calls += 1;
+            return .{ .completed = .{} };
+        }
+
+        fn event(_: *anyopaque, _: Event) void {}
+    };
+
+    var fake: Fake = .{};
+    var delivery = DeliveryCertainty.init();
+    var attempt_evidence: AttemptEvidence = .{};
+    var cancelled = std.atomic.Value(bool).init(false);
+    const messages = [_]types.ChatMessage{
+        .{ .role = .system, .content = "rules" },
+        .{ .role = .user, .content = "hello" },
+    };
+
+    try std.testing.expectError(error.InvalidProviderPrompt, (Provider{
+        .context = &fake,
+        .stream_fn = Fake.stream,
+    }).stream(std.testing.allocator, .{
+        .credential = .{ .direct = .{ .secret_bytes = "key" } },
+        .model = "model",
+        .retry_count = 1,
+        .messages = &messages,
+        .tool_choice = .auto,
+        .provider_options = .{},
+        .trace_ctx = .{},
+        .content_capture_limit = null,
+        .delivery = &delivery,
+        .attempt_evidence = &attempt_evidence,
+        .events = .{ .context = &fake, .emit_fn = Fake.event },
+        .cancel_flag = &cancelled,
+    }));
+    try std.testing.expectEqual(@as(usize, 0), fake.calls);
 }
 
 test "stream provider exposes its exact request serializer without streaming" {
@@ -457,8 +547,8 @@ test "stream provider exposes its exact request serializer without streaming" {
             self.calls += 1;
             return std.fmt.allocPrint(
                 alloc,
-                "model={s};messages={d};tools={d}",
-                .{ request.model, request.messages.len, request.tools.advertised_names.len },
+                "model={s};instructions={d};messages={d};tools={d}",
+                .{ request.model, request.instructions.len, request.messages.len, request.tools.advertised_names.len },
             );
         }
 
@@ -477,10 +567,12 @@ test "stream provider exposes its exact request serializer without streaming" {
         .stream_fn = Builder.stream,
         .build_request_fn = Builder.build,
     };
+    const instructions = [_]types.ChatMessage{.{ .role = .system, .content = "rules" }};
     const messages = [_]types.ChatMessage{.{ .role = .user, .content = "hello" }};
     const names = [_][]const u8{"terminal"};
     const body = (try provider.buildRequest(std.testing.allocator, .{
         .model = "test/model",
+        .instructions = &instructions,
         .messages = &messages,
         .tools = .{ .advertised_names = &names },
         .tool_choice = .auto,
@@ -490,7 +582,92 @@ test "stream provider exposes its exact request serializer without streaming" {
 
     try std.testing.expectEqual(@as(usize, 1), builder.calls);
     try std.testing.expectEqualStrings(
-        "model=test/model;messages=1;tools=1",
+        "model=test/model;instructions=1;messages=1;tools=1",
         body,
     );
+}
+
+test "stream provider rejects system messages in conversation before serialization" {
+    const Builder = struct {
+        calls: usize = 0,
+
+        fn build(
+            raw: ?*anyopaque,
+            alloc: Allocator,
+            _: RequestData,
+        ) anyerror![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.calls += 1;
+            return alloc.dupe(u8, "unexpected");
+        }
+
+        fn stream(_: ?*anyopaque, _: Allocator, _: ModelRequest) anyerror!Result {
+            return error.TestUnexpectedStream;
+        }
+    };
+
+    var builder: Builder = .{};
+    const messages = [_]types.ChatMessage{
+        .{ .role = .system, .content = "rules" },
+        .{ .role = .user, .content = "hello" },
+    };
+    const result = (Provider{
+        .context = &builder,
+        .stream_fn = Builder.stream,
+        .build_request_fn = Builder.build,
+    }).buildRequest(std.testing.allocator, .{
+        .model = "test/model",
+        .messages = &messages,
+        .tool_choice = .auto,
+        .provider_options = .{},
+    });
+    if (result) |body| {
+        if (body) |owned| std.testing.allocator.free(owned);
+        return error.TestExpectedInvalidProviderPrompt;
+    } else |err| {
+        try std.testing.expectEqual(error.InvalidProviderPrompt, err);
+    }
+    try std.testing.expectEqual(@as(usize, 0), builder.calls);
+}
+
+test "stream provider rejects non-system instructions before serialization" {
+    const Builder = struct {
+        calls: usize = 0,
+
+        fn build(
+            raw: ?*anyopaque,
+            alloc: Allocator,
+            _: RequestData,
+        ) anyerror![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.calls += 1;
+            return alloc.dupe(u8, "unexpected");
+        }
+
+        fn stream(_: ?*anyopaque, _: Allocator, _: ModelRequest) anyerror!Result {
+            return error.TestUnexpectedStream;
+        }
+    };
+
+    var builder: Builder = .{};
+    const instructions = [_]types.ChatMessage{.{ .role = .user, .content = "not trusted" }};
+    const messages = [_]types.ChatMessage{.{ .role = .user, .content = "hello" }};
+    const result = (Provider{
+        .context = &builder,
+        .stream_fn = Builder.stream,
+        .build_request_fn = Builder.build,
+    }).buildRequest(std.testing.allocator, .{
+        .model = "test/model",
+        .instructions = &instructions,
+        .messages = &messages,
+        .tool_choice = .auto,
+        .provider_options = .{},
+    });
+    if (result) |body| {
+        if (body) |owned| std.testing.allocator.free(owned);
+        return error.TestExpectedInvalidProviderPrompt;
+    } else |err| {
+        try std.testing.expectEqual(error.InvalidProviderPrompt, err);
+    }
+    try std.testing.expectEqual(@as(usize, 0), builder.calls);
 }

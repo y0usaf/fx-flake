@@ -56,7 +56,6 @@ pub const Capabilities = struct {
     supports_web_search: bool = false,
     supports_explicit_caching: bool = false,
     supports_implicit_caching: bool = false,
-    prompt_caching: bool = false,
     parallel_tool_calls: ?bool = null,
     context_window: ?u32 = null,
     max_output_tokens: ?u32 = null,
@@ -154,7 +153,6 @@ pub fn resolveProviderOptionsForCapabilities(
 ) ResolvedProviderOptions {
     var resolved: ResolvedProviderOptions = .{
         .parallel_tool_calls = capabilities.parallel_tool_calls,
-        .prompt_caching = capabilities.prompt_caching,
     };
     if (!effort.isDefault() and reasoningEffortSupported(capabilities, effort)) {
         resolved.reasoning = effort;
@@ -196,7 +194,7 @@ test "mergeCapabilities preserves provider controls and supplied fallback policy
         types.ReasoningEffort.literal("future-tier"),
         types.ReasoningEffort.literal("high"),
     };
-    const capabilities = mergeCapabilities(.{ .intrinsic_fast = true, .prompt_caching = true }, .{
+    const capabilities = mergeCapabilities(.{ .intrinsic_fast = true }, .{
         .reasoning_efforts = .fromSlice(&efforts),
         .supports_fast_mode = true,
         .supports_tool_use = true,
@@ -220,7 +218,6 @@ test "mergeCapabilities preserves provider controls and supplied fallback policy
     try std.testing.expect(capabilities.supports_web_search);
     try std.testing.expect(capabilities.supports_explicit_caching);
     try std.testing.expect(capabilities.supports_implicit_caching);
-    try std.testing.expect(capabilities.prompt_caching);
     try std.testing.expectEqual(@as(?u32, 300_000), capabilities.context_window);
     try std.testing.expectEqual(@as(?u32, 32_000), capabilities.max_output_tokens);
 }
@@ -321,6 +318,5 @@ test "request controls remain safe across repeated state transitions" {
 
 test "generic fallback capabilities contain no vendor policy" {
     const fallback = capabilitiesForModel("anthropic/claude-any");
-    try std.testing.expect(!fallback.prompt_caching);
     try std.testing.expect(fallback.context_window == null);
 }

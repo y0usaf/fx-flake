@@ -13,7 +13,7 @@ if (!supportsJspi()) {
 }
 
 const scriptDir = fileURLToPath(new URL(".", import.meta.url));
-const wasmPath = resolve(process.argv[2] || resolve(scriptDir, "../../zig-out/bin/fx-core.wasm"));
+const wasmPath = resolve(process.argv[2] || resolve(scriptDir, "../../zig-out/bin/omfx-core.wasm"));
 const temp = await mkdtemp(join(tmpdir(), "libfx-wasm-cache-"));
 const secondPath = join(temp, "second.wasm");
 const retryPath = join(temp, "retry.wasm");
@@ -41,6 +41,17 @@ const server = createServer((request, response) => {
 await new Promise((resolveListen) => server.listen(0, "127.0.0.1", resolveListen));
 
 const compileDescriptor = Object.getOwnPropertyDescriptor(WebAssembly, "compile");
+const instantiateDescriptor = Object.getOwnPropertyDescriptor(WebAssembly, "instantiate");
+const realInstantiate = WebAssembly.instantiate.bind(WebAssembly);
+const instances = [];
+Object.defineProperty(WebAssembly, "instantiate", {
+  ...instantiateDescriptor,
+  value: async (...args) => {
+    const instance = await realInstantiate(...args);
+    instances.push(new WeakRef(instance));
+    return instance;
+  },
+});
 const realCompile = WebAssembly.compile.bind(WebAssembly);
 let compileCalls = 0;
 let failNextCompile = false;
@@ -58,10 +69,14 @@ Object.defineProperty(WebAssembly, "compile", {
 });
 
 const agents = [];
+const signals = [];
 const options = (wasm = wasmPath) => ({
   backend: "wasm",
   wasm,
-  fetch,
+  fetch(input, init) {
+    signals.push({ method: init.method, signal: init.signal });
+    return fetch(init.method === "GET" ? `http://127.0.0.1:${server.address().port}/models` : input, init);
+  },
   apiKey: "wasm-cache-key",
   gatewayChatUrl: `http://127.0.0.1:${server.address().port}/chat`,
   model: "cache/model",
@@ -114,9 +129,22 @@ try {
   await recoveredRead.close();
   assert.equal(compileCalls, 5, "a rejected file read must be removed so the next attempt retries");
 
-  console.log(`${process.versions.bun ? "Bun" : "Node"} Wasm module cache passed: compilation reuse, retry, and Agent isolation`);
+  await Promise.all(agents.map((agent) => agent.close()));
+  assert.ok(signals.every(({ signal }) => signal instanceof AbortSignal));
+  // Completed catalog reads have already released their abort ownership.
+  assert.ok(signals.filter(({ method }) => method !== "GET").every(({ signal }) => signal.aborted));
+  const collect = globalThis.gc ?? (() => globalThis.Bun?.gc(true));
+  const deadline = Date.now() + 5000;
+  do {
+    await new Promise((resolveGc) => setTimeout(resolveGc, 10));
+    collect();
+  } while (instances.some((instance) => instance.deref()) && Date.now() < deadline);
+  assert.ok(instances.every((instance) => !instance.deref()), "retained closed Agents must release their Wasm instances");
+
+  console.log(`${process.versions.bun ? "Bun" : "Node"} Wasm module cache passed: compilation reuse, retry, isolation, and closed-instance release`);
 } finally {
   Object.defineProperty(WebAssembly, "compile", compileDescriptor);
+  Object.defineProperty(WebAssembly, "instantiate", instantiateDescriptor);
   await Promise.all(agents.map((agent) => agent.close().catch(() => {})));
   server.closeAllConnections();
   await new Promise((resolveClose) => server.close(resolveClose));

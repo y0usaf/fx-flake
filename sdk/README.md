@@ -21,6 +21,9 @@ import { createFxAgent } from "libfx";
 const agent = await createFxAgent({
   apiKey: process.env.AI_GATEWAY_API_KEY,
   model: "google/gemini-2.5-flash-lite",
+  onEvent(event) {
+    if (event.type === "transport.response") console.log(event.elapsedMs);
+  },
 });
 
 const turn = agent.prompt("Explain this project.");
@@ -38,6 +41,17 @@ await agent.close();
 Agent configuration uses named options; `env` is reserved for
 `createFxTerminal()`.
 
+The host selects the model. Agent creation does not fetch the Gateway model
+catalog. Prompting can resolve model capabilities and context capacity through
+the supplied `fetch`; fx caches that metadata for the agent.
+
+`onEvent` receives runtime diagnostics separately from model output. Transport
+events report request start, response status and elapsed time, safe Gateway
+request metadata, and failures. Credentials and raw headers are never included.
+
+libfx makes at most one automatic retry after a retryable transport failure and
+only before model output or tool effects escape. Cancellation prevents a retry.
+
 `prompt(input, { signal? })` accepts a string or text/resource blocks. It
 returns an async iterable of normalized events:
 
@@ -45,6 +59,28 @@ returns an async iterable of normalized events:
 - `reasoning_delta` when supplied by the provider
 - `tool_start`
 - `tool_end`
+
+Consume the turn while it runs, then await `turn.result`. Output is lossless and
+backpressured: a slow reader pauses production instead of growing an unlimited
+event queue. Awaiting only `turn.result` can wait for an unread stream to drain.
+If you only need the result, explicitly discard events:
+
+```js
+const turn = agent.prompt("Update the index.");
+for await (const _ of turn) {}
+const result = await turn.result;
+```
+
+A turn has one event consumer. Breaking out of its iterator cancels the turn;
+`turn.cancel()` and `agent.close()` also release blocked output. Transport or
+message-decoding failures reject the result instead of returning success with
+missing text.
+
+Native transport buffers at most 8 MiB of output bytes. Unread SDK events apply
+backpressure at 1 MiB of encoded messages or 256 events. One message can exceed
+that threshold when the queue is empty; an individual encoded ACP message is
+limited to 64 MiB on both backends. These are transport bounds, not a total
+answer-size limit or a bound on retained conversation history.
 
 Only one prompt may run at a time. `checkpoint()` is idle-only and returns
 opaque, bounded, versioned bytes. Restore them only when creating a fresh
@@ -54,9 +90,29 @@ agent:
 const restored = await createFxAgent({ apiKey, model, checkpoint });
 ```
 
+An already-aborted prompt signal returns `cancelled` without a model request
+or a history change. The next prompt can run normally.
+
 The checkpoint contains conversation history and usage only. The host owns
 durable storage and must resupply models, credentials, instructions, tools,
 MCP clients, and skill records.
+
+## Models
+
+Model discovery is explicit and does not create an Agent or load native or Wasm
+artifacts:
+
+```js
+import { listModels } from "libfx";
+
+const models = await listModels({
+  apiKey: process.env.AI_GATEWAY_API_KEY,
+});
+```
+
+`listModels()` performs one bounded Gateway request and returns sorted, unique
+language-model IDs. It accepts the same optional `fetch` override as the Agent
+API.
 
 ## JavaScript tools and instructions
 
@@ -82,13 +138,30 @@ const agent = await createFxAgent({
 
 The JavaScript host is the authority for tool effects. The same descriptors,
 schemas, cancellation, results, and events are used by N-API and WebAssembly.
+Cancelling a prompt aborts its tools' signals and stops waiting for their
+callbacks. Late results and rejections are ignored. Tools remain responsible
+for stopping their own work when their signal is aborted.
 Instructions are limited to 64 KiB of UTF-8 text, including text assembled by
-the MCP and skills adapters.
+the MCP and skills adapters. They are the complete host-owned system context:
+libfx adds no hidden base prompt, and omitting `instructions` sends no system
+message.
 
 ## MCP
 
 `libfx/mcp` accepts a host-owned MCP client. Transport, authentication,
-elicitation, and cleanup remain outside the kernel.
+elicitation, and cleanup remain outside the kernel. The client uses the MCP
+TypeScript SDK v1 signature: `callTool(params, resultSchema?, options?)`, with
+cancellation passed in `options`. Tool text and structured data
+reach the model together. PNG, JPEG, GIF, and WebP tool images reach models that
+advertise image input support; other models receive an explicit omission notice.
+Images are retained in checkpoints within the existing checkpoint size limit.
+Each image may contain up to 5 MiB of base64 data, with at most eight images and
+an 8 MiB result frame. Ordinary host tool objects remain JSON text. Resource and
+prompt options supply text instructions; non-text context has an omission notice.
+Tool catalogs are paginated up to the existing 64-tool bound. Tool names are
+normalized for model APIs, with collisions kept distinct and original names used
+for calls to the MCP client. Each tool description and JSON schema may contain up
+to 64 KiB, within the control message's 8 MiB limit.
 
 ```js
 import { createMcpAdapter } from "libfx/mcp";
@@ -140,6 +213,9 @@ processes maintain their own module caches.
 
 Node.js 20+ is supported. Browser WebAssembly requires a JSPI-capable browser.
 Some Node versions require `--experimental-wasm-jspi`.
+Bun 1.4.2 is the tested recommendation for Bun's WebAssembly backend.
+Bun 1.3.14 can crash when a hot WebAssembly loop resumes through JSPI during
+JIT tier-up.
 
 ## Interactive terminal
 

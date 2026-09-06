@@ -57,6 +57,7 @@ function startFakeOAuth(
   tokens: string[],
   issuerPath = "",
   beforeTokenResponse?: () => Promise<void>,
+  refreshTokens: string[] = [],
 ) {
   const requests: Array<{
     method: string;
@@ -91,7 +92,7 @@ function startFakeOAuth(
         if (!accessToken) return new Response("unexpected refresh", { status: 500 });
         return Response.json({
           access_token: accessToken,
-          refresh_token: "rotated-refresh-token",
+          refresh_token: refreshTokens.shift() ?? "rotated-refresh-token",
           expires_in: 3600,
           scope: "openid offline_access use:ai-gateway",
           token_type: "Bearer",
@@ -225,7 +226,12 @@ test(
   "fx ask refreshes an expired login then forces one refresh and retry after 401",
   async () => {
     const home = mkdtempSync(join(tmpdir(), "fx-auth-refresh-e2e-"));
-    const oauth = startFakeOAuth([EXPIRED_REFRESH_TOKEN, RETRY_REFRESH_TOKEN]);
+    const oauth = startFakeOAuth(
+      [EXPIRED_REFRESH_TOKEN, RETRY_REFRESH_TOKEN],
+      "",
+      undefined,
+      ["first-rotated-refresh-token", "second-rotated-refresh-token"],
+    );
     writeFxLogin(home, oauth.issuerUrl);
     const gateway = startFakeGateway([
       new Response(JSON.stringify({ error: { message: "expired" } }), {
@@ -278,12 +284,13 @@ test(
       expect(oauth.requests[1].body).toContain("client_id=test-client");
       expect(oauth.requests[1].body).toContain("refresh_token=seeded-refresh-token");
       expect(oauth.requests[3].body).toContain("client_id=test-client");
-      expect(oauth.requests[3].body).toContain("refresh_token=rotated-refresh-token");
+      expect(oauth.requests[3].body).toContain("refresh_token=first-rotated-refresh-token");
 
       const persisted = JSON.parse(
         readFileSync(join(home, ".fx", "auth.json"), "utf8"),
       );
       expect(persisted.access_token).toBe(RETRY_REFRESH_TOKEN);
+      expect(persisted.refresh_token).toBe("second-rotated-refresh-token");
       expect(result.stdout).not.toContain(EXPIRED_REFRESH_TOKEN);
       expect(result.stdout).not.toContain(RETRY_REFRESH_TOKEN);
       expect(result.stderr).not.toContain(EXPIRED_REFRESH_TOKEN);

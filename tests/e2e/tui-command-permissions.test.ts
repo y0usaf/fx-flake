@@ -21,7 +21,6 @@ import { join } from "node:path";
 import { FX_BIN, runFx } from "../evals/eval-helpers";
 import {
   canonicalSubagentIdForStore,
-  classifierEvidenceFromRequest,
   fakeGatewayPermissionDecision,
   heldFakeGatewayFinalText,
   isVolatileTokenStatusRow,
@@ -138,16 +137,6 @@ function permissionDecision(
   toolCallId = "permission_decision_1",
 ) {
   return fakeGatewayPermissionDecision(decision, toolCallId, "deterministic test decision");
-}
-
-function classifierTrustContext(body: string): string {
-  const evidence = classifierEvidenceFromRequest(body);
-  const startMarker = "review_origin: ";
-  const endMarker = "Normalized action evidence";
-  const start = evidence.indexOf(startMarker);
-  const end = evidence.indexOf(endMarker, start);
-  if (start < 0 || end < 0) throw new Error("classifier trust context missing");
-  return evidence.slice(start, end);
 }
 
 function subagentCreateCall(
@@ -816,7 +805,7 @@ function normalizeVolatileStatusRows(grid: string[]): string[] {
     /^• Streaming \([^)]*\)$/.test(line) ||
       isVolatileTokenStatusRow(line)
       ? "<status>"
-      : line.replace(/\s+YOLO enabled: fx permission checks disabled$/, "")
+      : line.replace(/\s+Full access enabled: fx permission checks disabled$/, "")
   );
 }
 
@@ -824,8 +813,8 @@ test("volatile token status rows normalize before transcript grid comparison", (
   expect(normalizeVolatileStatusRows(["  (↑10 ↓5)"])).toEqual(["<status>"]);
   expect(normalizeVolatileStatusRows(["  0s (↑10 ↓5)"])).toEqual(["<status>"]);
   expect(normalizeVolatileStatusRows([
-    "YOLO · gpt-5                 YOLO enabled: fx permission checks disabled",
-  ])).toEqual(["YOLO · gpt-5"]);
+    "full access · gpt-5                 Full access enabled: fx permission checks disabled",
+  ])).toEqual(["full access · gpt-5"]);
 });
 
 describe("effect-aware command permissions", () => {
@@ -918,7 +907,7 @@ describe("effect-aware command permissions", () => {
         ],
         { cwd: root.workspace, env: gatewayEnv(root, cliResumeGateway) },
       );
-      expect(cliResume.code).toBe(0);
+      expect(cliResume.code, cliResume.stdout + cliResume.stderr).toBe(0);
       expect(cliResume.stderr).toBe("");
       expect(cliResumeGateway.requests).toHaveLength(1);
       expectGroupedContinuationRequest(cliResumeGateway.requests[0]!.body, feedback);
@@ -3188,6 +3177,17 @@ describe("effect-aware command permissions", () => {
       );
       expect(gateway.requests).toHaveLength(2);
       expect(gateway.classifierRequests).toHaveLength(1);
+      const classifierPrompt = JSON.parse(
+        gateway.classifierRequests[0]!.body,
+      ).prompt as Array<{ role: string }>;
+      const firstConversationIndex = classifierPrompt.findIndex(
+        (message) => message.role !== "system",
+      );
+      expect(classifierPrompt[0]?.role).toBe("system");
+      expect(firstConversationIndex).toBeGreaterThan(0);
+      expect(
+        classifierPrompt.slice(firstConversationIndex).map((message) => message.role),
+      ).not.toContain("system");
       expect(gateway.classifierRequests[0]!.headers.get("ai-language-model-id")).toBe(
         "openai/gpt-5.6-luna",
       );

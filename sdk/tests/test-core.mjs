@@ -6,7 +6,7 @@ import { fileURLToPath } from "node:url";
 import { createFxAgent, supportsJspi } from "../node.js";
 
 const scriptDir = fileURLToPath(new URL(".", import.meta.url));
-const wasmPath = resolve(process.argv[2] || resolve(scriptDir, "../../zig-out/bin/fx-core.wasm"));
+const wasmPath = resolve(process.argv[2] || resolve(scriptDir, "../../zig-out/bin/omfx-core.wasm"));
 if (!supportsJspi()) {
   console.error("Node JSPI is disabled. Run with --experimental-wasm-jspi");
   process.exit(2);

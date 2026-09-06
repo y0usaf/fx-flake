@@ -19,6 +19,7 @@ const ask_user_question_impl = @import("../tools/agent/ask_user_question.zig");
 const subagent_impl = @import("../tools/agent/subagent.zig");
 const vision_impl = @import("../tools/agent/vision.zig");
 const edit_file_impl = @import("../tools/filesystem/edit_file.zig");
+const ast_symbols_impl = @import("../tools/filesystem/ast_symbols.zig");
 const glob_files_impl = @import("../tools/filesystem/glob_files.zig");
 const grep_files_impl = @import("../tools/filesystem/grep_files.zig");
 const read_file_impl = @import("../tools/filesystem/read_file.zig");
@@ -41,6 +42,8 @@ const grep_files_description =
     "Search text files for a literal substring, optionally narrowed by path/include, with output modes for matching lines, files-with-matches, or counts plus head_limit/offset pagination and bounded context_lines for matches mode. Paths may be workspace-relative or external using an absolute path, ~/..., or a relative workspace escape such as ../...; external access is subject to permission policy. Use include as the type/path filter, such as *.zig. When to use: find exact symbols, strings, TODOs, or usage sites. When NOT to use: regex is not supported; avoid unknown-concept exploration, filename lookup, known-path reads, and shell grep; do not repeat the same or equivalent search after a caller search only finds a definition.";
 const read_file_description =
     "Read one UTF-8 text file with bounded line-numbered output and optional start_line/line_count range. Paths may be workspace-relative or external using an absolute path, ~/..., or a relative workspace escape such as ../...; external access is subject to permission policy. When to use: inspect an exact known path before editing or explaining code. When NOT to use: list directories, search many files, read binary data, or bypass dedicated search tools.";
+const ast_symbols_description =
+    "Parse one source file with Tree-sitter and list its named declarations with kinds and line numbers. Supports TypeScript, TSX, Python, Go, Rust, Nix, and Zig. Paths may be workspace-relative or external using an absolute path, ~/..., or a relative workspace escape such as ../...; external access is subject to permission policy. When to use: inspect a file's structural outline or locate declarations without text matching. When NOT to use: search across files, inspect function bodies, or edit code.";
 const write_file_description =
     "Create or overwrite a file using complete contents. Paths may be workspace-relative or external using an absolute path, ~/..., or a relative workspace escape such as ../...; external access is subject to permission policy. When to use: add a new file or intentionally replace an entire generated/small file. When NOT to use: targeted edits to existing files, partial replacements, deleting files, or unapproved external paths.";
 const edit_file_description =
@@ -155,9 +158,9 @@ const shell_process_request_properties = [_]model_tool_schema.Property{.{
 }};
 
 const skill_description =
-    "Read an installed skill or one of its relative text resources in bounded chunks. Pass the exact advertised location when one is listed, then use next_offset to continue. When to use: the user explicitly invokes a listed skill or the task clearly matches one. When NOT to use: generic exploration, ordinary file edits, guessing from vague words, or installing a missing skill.";
+    "Load an installed skill or one required relative text resource completely. Copy the exact advertised location. Resolve paths mentioned in skill instructions from the selected skill directory, not the workspace. Read referenced text with the same location and its relative resource path. When to use: the user explicitly invokes a listed skill or the task clearly matches one. When NOT to use: installing a missing skill.";
 const capability_search_description =
-    "Find relevant installed skills and configured MCP tools from one natural-language task. The runtime owns domain routing, ranking, catalog bounds, and terminal no-match handling. Set server only when an exact configured MCP alias is already known. Load one exact skill result with skill or select one exact MCP result with mcp_select_tool. Do not guess identities or repeat a no-match search.";
+    "Find installed skills and configured MCP tools for a described capability. Optionally restrict MCP results to one exact configured server. Results describe this query; no_match does not rule out another query. Use returned skill locations with skill. Matching MCP schemas are loaded automatically within the schema budget; call advertised tools directly or use mcp_select_tool for explicit selection. Do not guess identities.";
 const install_skill_description =
     "Install a reusable skill from a supported source into fx managed skill storage. When to use: the user asks to install a skill or pastes a skills install command. When NOT to use: no installation is required, install packages, fetch unrelated repos, or modify project code.";
 const mcp_select_tool_description =
@@ -308,6 +311,37 @@ pub const read_file = ToolSpec{
     .call = read_file_impl.call,
     .reads_only_fn = read_file_impl.readsOnly,
     .irreversible_fn = read_file_impl.isIrreversible,
+};
+
+pub const ast_symbols = ToolSpec{
+    .name = "ast_symbols",
+    .description = ast_symbols_description,
+    .model_schema = .{
+        .name = "ast_symbols",
+        .description = ast_symbols_description,
+        .input_schema = .{
+            .properties = &.{.{
+                .name = "path",
+                .json_type = .string,
+                .description = "Path to a TypeScript, TSX, Python, Go, Rust, Nix, or Zig source file.",
+            }},
+            .required = &.{"path"},
+            .additional_properties = false,
+        },
+    },
+    .executor_kind = .ast_symbols,
+    .activity_kind = .read,
+    .requires_approval = false,
+    .action_label = "Parsing",
+    .completed_action_label = "Parsed",
+    .label_arg_kind = .path,
+    .label_arg_default = "source file",
+    .permission_target_kind = .path_existing,
+    .decode = ast_symbols_impl.decode,
+    .validate = ast_symbols_impl.validate,
+    .call = ast_symbols_impl.call,
+    .reads_only_fn = ast_symbols_impl.readsOnly,
+    .irreversible_fn = ast_symbols_impl.isIrreversible,
 };
 
 pub const write_file = ToolSpec{
@@ -516,7 +550,7 @@ pub const capability_search = ToolSpec{
             .additional_properties = false,
         },
     },
-    .executor_kind = .skill,
+    .executor_kind = .capability_search,
     .activity_kind = .read,
     .requires_approval = false,
     .action_label = "Searching capabilities",
@@ -540,12 +574,11 @@ pub const skill = ToolSpec{
         .description = skill_description,
         .input_schema = .{
             .properties = &.{
-                .{ .name = "name", .json_type = .string, .description = "The name of the skill from the available skills list." },
                 .{ .name = "location", .json_type = .string, .description = "The exact advertised location of the selected skill." },
-                .{ .name = "resource", .json_type = .string, .description = "Optional relative text resource within the selected skill. Defaults to SKILL.md." },
-                .{ .name = "offset", .json_type = .integer, .description = "Optional UTF-8 byte offset. Use the returned next_offset to continue." },
+                .{ .name = "resource", .json_type = .string, .description = "Optional relative text resource within the selected skill. Omit or pass an empty string to read SKILL.md." },
             },
-            .required = &.{"name"},
+            .required = &.{"location"},
+            .additional_properties = false,
         },
     },
     .executor_kind = .skill,
@@ -558,6 +591,7 @@ pub const skill = ToolSpec{
     .presentation_fn = skill_impl.presentation,
     .permission_target_kind = .none,
     .decode = skill_impl.decode,
+    .prepare_skill_call_fn = skill_impl.prepare,
     .validate = skill_impl.validate,
     .call = skill_impl.call,
     .reads_only_fn = skill_impl.readsOnly,
@@ -826,6 +860,7 @@ pub const all = [_]tool_dispatch.Tool{
     glob_files,
     grep_files,
     read_file,
+    ast_symbols,
     write_file,
     edit_file,
     web_fetch,
@@ -846,6 +881,7 @@ pub const registry = tool_dispatch.Registry{ .tools = all[0..] };
 
 pub const advertisement_order = [_][]const u8{
     "read_file",
+    "ast_symbols",
     "glob_files",
     "grep_files",
     "edit_file",
@@ -866,6 +902,7 @@ pub const read_only_tool_names = [_][]const u8{
     "read_file",
     "glob_files",
     "grep_files",
+    "ast_symbols",
 };
 
 pub fn isReadOnlyToolName(name: []const u8) bool {
@@ -930,7 +967,7 @@ test "built-in model-facing tool contract stays byte exact" {
 
     const actual_hex = std.fmt.bytesToHex(hasher.finalResult(), .lower);
     try std.testing.expectEqualStrings(
-        "47e84930e1fdc99133e76843f795891b35592d32615cacb76a3dfc81e1b23b7a",
+        "1ecd1fc80f31c72faca85b77a46e031aa5b6c280407c2dba4df62042147d96c0",
         &actual_hex,
     );
 }
@@ -987,6 +1024,7 @@ test "built-in tools register exact active local order" {
         "glob_files",
         "grep_files",
         "read_file",
+        "ast_symbols",
         "write_file",
         "edit_file",
         "web_fetch",
@@ -1357,13 +1395,14 @@ test "built-in skill owns product metadata schema and callbacks" {
     defer std.testing.allocator.free(schema_json);
 
     try std.testing.expectEqualStrings("skill", skill.name);
-    try std.testing.expect(std.mem.find(u8, skill.description, "relative text resources in bounded chunks") != null);
+    try std.testing.expect(std.mem.find(u8, skill.description, "relative text resource completely") != null);
+    try std.testing.expect(std.mem.find(u8, skill.description, "selected skill directory") != null);
     try std.testing.expect(std.mem.find(u8, skill.description, "the task clearly matches one") != null);
     try std.testing.expect(std.mem.find(u8, skill.description, "installing a missing skill") != null);
     try std.testing.expect(std.mem.find(u8, schema_json, "\"location\":{\"type\":\"string\"") != null);
     try std.testing.expect(std.mem.find(u8, schema_json, "\"resource\":{\"type\":\"string\"") != null);
-    try std.testing.expect(std.mem.find(u8, schema_json, "\"offset\":{\"type\":\"integer\"") != null);
-    try std.testing.expect(std.mem.find(u8, schema_json, "\"required\":[\"name\"]") != null);
+    try std.testing.expect(std.mem.find(u8, schema_json, "\"offset\":{\"type\":\"integer\"") == null);
+    try std.testing.expect(std.mem.find(u8, schema_json, "\"required\":[\"location\"]") != null);
     try std.testing.expect(std.mem.find(u8, schema_json, "\"required\":[\"name\",\"location\"]") == null);
     try std.testing.expectEqual(tool_dispatch.ExecutorKind.skill, skill.executor_kind);
     try std.testing.expectEqual(types.ToolActivityKind.read, skill.activity_kind);
@@ -1462,7 +1501,7 @@ test "built-in capability_search owns unified bounded metadata schema and callba
 
     try std.testing.expectEqualStrings("capability_search", capability_search.name);
     try std.testing.expect(std.mem.find(u8, capability_search.description, "configured MCP tools") != null);
-    try std.testing.expect(std.mem.find(u8, capability_search.description, "runtime owns") != null);
+    try std.testing.expect(std.mem.find(u8, capability_search.description, "no_match does not rule out another query") != null);
     try std.testing.expect(std.mem.find(u8, schema_json, "\"query\":{\"type\":\"string\",\"minLength\":1,\"maxLength\":4096") != null);
     try std.testing.expect(std.mem.find(u8, schema_json, "\"server\":{\"type\":\"string\",\"minLength\":1") != null);
     try std.testing.expect(std.mem.find(u8, schema_json, "\"kind\"") == null);
@@ -1470,7 +1509,7 @@ test "built-in capability_search owns unified bounded metadata schema and callba
     try std.testing.expect(std.mem.find(u8, schema_json, "\"cursor\"") == null);
     try std.testing.expect(std.mem.find(u8, schema_json, "\"required\":[\"query\"]") != null);
     try std.testing.expect(capability_search.model_visible);
-    try std.testing.expectEqual(tool_dispatch.ExecutorKind.skill, capability_search.executor_kind);
+    try std.testing.expectEqual(tool_dispatch.ExecutorKind.capability_search, capability_search.executor_kind);
     try std.testing.expectEqual(types.ToolActivityKind.read, capability_search.activity_kind);
     try std.testing.expect(!capability_search.requires_approval);
     try std.testing.expectEqual(tool_dispatch.LabelArgKind.query, capability_search.label_arg_kind);
@@ -1750,6 +1789,7 @@ test "built-in registry uses executable web_fetch implementation" {
     defer result.deinit(std.testing.allocator);
 
     const body = switch (result) {
+        .rich => return error.TestUnexpectedRichResult,
         .success => return error.TestUnexpectedResult,
         .failure => |body| body,
     };
@@ -1769,6 +1809,7 @@ test "built-in read-only tool set matches plan inspection tools" {
         "read_file",
         "glob_files",
         "grep_files",
+        "ast_symbols",
     };
 
     try std.testing.expectEqual(expected_names.len, read_only_tool_names.len);

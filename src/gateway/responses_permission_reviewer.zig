@@ -77,6 +77,7 @@ fn buildReviewPayload(
     alloc: Allocator,
     model: []const u8,
     _: []const u8,
+    instructions: []const types.ChatMessage,
     messages: []const types.ChatMessage,
     target_call_id: []const u8,
     deadline: std.Io.Clock.Timestamp,
@@ -93,6 +94,7 @@ fn buildReviewPayload(
     defer alloc.free(expanded);
     return runtime.adapter.build_fn(alloc, .{
         .model = model,
+        .instructions = instructions,
         .messages = expanded,
         .tools = .{ .additional_functions = &.{permission_auto_classifier.function_schema} },
         .tool_choice = .required,
@@ -105,6 +107,7 @@ fn buildReviewPayload(
 pub fn buildPayloadForTest(
     alloc: Allocator,
     model: []const u8,
+    instructions: []const types.ChatMessage,
     messages: []const types.ChatMessage,
     target_call_id: []const u8,
     deadline: std.Io.Clock.Timestamp,
@@ -126,6 +129,7 @@ pub fn buildPayloadForTest(
         alloc,
         model,
         "",
+        instructions,
         messages,
         target_call_id,
         deadline,
@@ -139,6 +143,46 @@ test "host-managed permission review accepts absent local credential metadata" {
     try std.testing.expect(reviewInputFailure(.{
         .credential_source = .host_managed,
     }, true) == null);
+}
+
+test "permission review separates instructions from tool conversation" {
+    const Capture = struct {
+        fn build(alloc: Allocator, request: stream_provider.RequestData) ![]u8 {
+            try std.testing.expectEqual(@as(usize, 1), request.instructions.len);
+            try std.testing.expectEqual(types.ChatRole.system, request.instructions[0].role);
+            try std.testing.expectEqualStrings("Review only install.", request.instructions[0].content.?);
+            try std.testing.expectEqual(@as(usize, 3), request.messages.len);
+            for (request.messages) |message| try std.testing.expect(message.role != .system);
+            return alloc.dupe(u8, "payload");
+        }
+    };
+
+    var cancel = std.atomic.Value(bool).init(false);
+    const deadline = std.Io.Clock.Timestamp.fromNow(io_mod.getIo(), .{
+        .clock = .awake,
+        .raw = .fromSeconds(1),
+    });
+    const instructions = [_]types.ChatMessage{.{ .role = .system, .content = "Review only install." }};
+    const messages = [_]types.ChatMessage{
+        .{ .role = .user, .content = "Install dependencies." },
+        .{ .role = .assistant, .tool_calls = &.{.{
+            .id = "install",
+            .name = "run_command",
+            .arguments_json = "{\"command\":\"pnpm install\"}",
+        }} },
+    };
+    const payload = try buildPayloadForTest(
+        std.testing.allocator,
+        "gpt-review",
+        &instructions,
+        &messages,
+        "install",
+        deadline,
+        &cancel,
+        Capture.build,
+    );
+    defer std.testing.allocator.free(payload);
+    try std.testing.expectEqualStrings("payload", payload);
 }
 
 const OwnedResult = struct {

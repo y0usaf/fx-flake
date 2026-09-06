@@ -138,7 +138,6 @@ const Summary = struct {
     timed_out: usize = 0,
     denied: usize = 0,
     cancelled: usize = 0,
-    deferred: usize = 0,
     completion_unreported: usize = 0,
     not_executed: usize = 0,
 };
@@ -280,7 +279,7 @@ fn observeTool(summary: *Summary, detail: ?*const ToolDetailRecord) void {
             },
             .denied => summary.denied += 1,
             .cancelled => summary.cancelled += 1,
-            .deferred => summary.deferred += 1,
+            .deferred => {},
         }
     }
 }
@@ -421,11 +420,6 @@ fn formatGroupHeader(
     try appendSegment(&out.writer, summary.failed, "failed");
     try appendSegment(&out.writer, summary.denied, "denied");
     try appendSegment(&out.writer, summary.cancelled, "cancelled");
-    try appendSegment(
-        &out.writer,
-        summary.deferred,
-        if (summary.deferred == 1) "command not run" else "commands not run",
-    );
 
     const plain = try out.toOwnedSlice();
     defer alloc.free(plain);
@@ -896,6 +890,7 @@ fn buildWithStyleAndStats(
 
     for (entries, 0..) |entry, entry_index| {
         try build_checkpoint.tick(checkpoint);
+        if (mode == .compact and !transcript_blocks.isEntryVisibleInCompactPresentation(entry)) continue;
         const entry_id = toolStatusEntryId(entry) orelse continue;
         const detail = detailForEntry(details, &detail_indices, entry_id, stats);
         if (statusNamesAsk(entry, detail)) continue;
@@ -1047,6 +1042,7 @@ fn buildWithStyleAndStats(
 
         while (index < entries.len) : (index += 1) {
             try build_checkpoint.tick(checkpoint);
+            if (!transcript_blocks.isEntryVisibleInCompactPresentation(entries[index])) continue;
             if (presentation_group_indices[index] != null) break;
             if (toolStatusEntryId(entries[index])) |group_entry_id| {
                 const group_detail = detailForEntry(details, &detail_indices, group_entry_id, stats);
@@ -1184,11 +1180,11 @@ test "small minimal tool groups surface canonical action targets" {
     );
 }
 
-test "minimal tool groups preserve denied and not-run action text" {
+test "minimal tool groups keep instruction refresh neutral and denials visible" {
     const alloc = std.testing.allocator;
     const entries = [_]TranscriptEntry{
         .{ .raw_bytes = .{ .id = 1, .bytes = "⊘ Denied by auto agent zig build\n", .class = .tool_status } },
-        .{ .raw_bytes = .{ .id = 2, .bytes = "↻ Not run — project instructions changed: runtime.zig\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 2, .bytes = "↻ Reading project instructions before continuing: runtime.zig\n", .class = .tool_status } },
     };
     const details = [_]ToolDetailRecord{
         .{ .entry_id = 1, .tool_name = @constCast("terminal"), .activity_kind = .command, .outcome = .denied },
@@ -1199,27 +1195,28 @@ test "minimal tool groups preserve denied and not-run action text" {
     defer projection.deinit(alloc);
 
     try std.testing.expectEqualStrings(
-        "● 2 tool calls · 1 read · 1 command · 1 denied · 1 command not run\n" ++
+        "● 2 tool calls · 1 read · 1 command · 1 denied\n" ++
             "├ Denied by auto agent zig build\n" ++
-            "└ Not run — project instructions changed: runtime.zig",
+            "└ Reading project instructions before continuing: runtime.zig",
         projection.entry_actions.items[0].override.bytes,
     );
 }
 
-test "minimal tool group pluralizes context-withheld commands" {
+test "minimal tool group counts instruction refresh attempts without failure counts" {
     const alloc = std.testing.allocator;
-    const header = try formatGroupHeader(
-        alloc,
-        .{ .total = 3, .deferred = 3 },
-        120,
-        .{},
-    );
+    var summary = Summary{};
+    for (0..3) |_| {
+        observeTool(&summary, &.{
+            .entry_id = 1,
+            .tool_name = @constCast("shell"),
+            .activity_kind = .command,
+            .outcome = .deferred,
+        });
+    }
+    const header = try formatGroupHeader(alloc, summary, 120, .{});
     defer alloc.free(header);
 
-    try std.testing.expectEqualStrings(
-        "● 3 tool calls · 3 commands not run",
-        header,
-    );
+    try std.testing.expectEqualStrings("● 3 tool calls · 3 commands", header);
 }
 
 test "focused tool remains counted but is omitted from stable child rows" {

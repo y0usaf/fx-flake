@@ -44,11 +44,6 @@ pub noinline fn decodeOwnedSearchQuery(
     errdefer alloc.free(query);
     const prepared = lexical_relevance.prepare(query) catch |err| switch (err) {
         error.QueryTooLong => unreachable,
-        error.TooManyTokens => {
-            const body = try prefixedFailure(alloc, tool_name, " query must not exceed 64 tokens");
-            alloc.free(query);
-            return .{ .failure = body };
-        },
     };
     const input = try alloc.create(OwnedSearchQueryInput);
     input.* = .{ .query = query, .prepared = prepared };

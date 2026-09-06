@@ -1,6 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const command_policy = @import("command_policy.zig");
+const managed_execution = @import("../execution/managed_execution.zig");
 const file_mutation_contract = @import("file_mutation_contract.zig");
 const text_utils = @import("../shared/text_utils.zig");
 const tool_args = @import("tool_args.zig");
@@ -28,6 +29,155 @@ pub const ToolActionInput = struct {
     display_target: ?[]const u8 = null,
     is_available_dynamic_mcp_tool: bool = false,
 };
+
+pub const SubagentActionState = union(enum) {
+    identity,
+    active,
+    completed,
+    stopped: []const u8,
+};
+
+pub const SubagentAction = struct {
+    label: []u8,
+    detail: []u8,
+
+    pub fn deinit(self: SubagentAction, alloc: Allocator) void {
+        alloc.free(self.label);
+        alloc.free(self.detail);
+    }
+};
+
+/// The caller owns the returned label and detail. Invalid requests have no projection.
+pub fn subagentAction(
+    alloc: Allocator,
+    call: ToolCall,
+    state: SubagentActionState,
+) Allocator.Error!?SubagentAction {
+    if (!std.mem.eql(u8, call.name, "subagent")) return null;
+    var scratch_state = std.heap.ArenaAllocator.init(alloc);
+    defer scratch_state.deinit();
+    const scratch = scratch_state.allocator();
+    const outer = tool_args.parseToolArgsObject(scratch, call.arguments_json) catch |err| return switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        else => null,
+    };
+    const args = if (outer.get("request")) |request| switch (request) {
+        .object => |object| object,
+        else => return null,
+    } else outer;
+    const action = tool_args.optionalStringArg(args, "action") orelse return null;
+    const named = std.mem.eql(u8, action, "message");
+    if (!named and !std.mem.eql(u8, action, "run")) return null;
+    const raw_name = if (named) tool_args.optionalStringArg(args, "agent") orelse return null else "Subagent";
+    const raw_preview = tool_args.optionalStringArg(args, if (named) "message" else "task") orelse return null;
+    const name = try text_utils.encodeTerminalSafe(scratch, raw_name, 64);
+    const preview = try subagentPreview(scratch, raw_preview);
+    const label = switch (state) {
+        .identity => try alloc.dupe(u8, name.bytes),
+        .active => try std.fmt.allocPrint(alloc, "{s} working", .{name.bytes}),
+        .completed => try std.fmt.allocPrint(alloc, "{s} {s}", .{ name.bytes, if (named) "replied" else "finished" }),
+        .stopped => |reason| if (std.mem.eql(u8, reason, "Failed"))
+            try std.fmt.allocPrint(alloc, "{s} failed", .{name.bytes})
+        else if (std.mem.eql(u8, reason, "Cancelled") or std.mem.eql(u8, reason, "Interrupted"))
+            try std.fmt.allocPrint(alloc, "{s} interrupted", .{name.bytes})
+        else
+            try std.fmt.allocPrint(alloc, "{s} {s}", .{ reason, name.bytes }),
+    };
+    errdefer alloc.free(label);
+    const detail = if (preview.len == 0)
+        try alloc.dupe(u8, "")
+    else
+        try std.fmt.allocPrint(alloc, "· {s}", .{preview});
+    return .{ .label = label, .detail = detail };
+}
+
+fn subagentPreview(alloc: Allocator, raw: []const u8) Allocator.Error![]u8 {
+    var buffer: [124]u8 = undefined;
+    var len: usize = 0;
+    var pending_space = false;
+    // Bound scanning even when a large request contains only whitespace.
+    const source = raw[0..text_utils.utf8BackwardBoundary(raw, @min(raw.len, 16 * 1024))];
+    for (source) |byte| {
+        if (std.ascii.isWhitespace(byte)) {
+            pending_space = len > 0;
+            continue;
+        }
+        if (pending_space) {
+            buffer[len] = ' ';
+            len += 1;
+            pending_space = false;
+        }
+        if (len == buffer.len) break;
+        buffer[len] = byte;
+        len += 1;
+        if (len == buffer.len) break;
+    }
+    const encoded = try text_utils.encodeTerminalSafe(alloc, buffer[0..len], 120);
+    return encoded.bytes;
+}
+
+/// Only structured child terminal failures change the failure label.
+pub fn subagentFailureLabel(alloc: Allocator, call: ToolCall, output: []const u8) Allocator.Error![]const u8 {
+    if (!std.mem.eql(u8, call.name, "subagent")) return "Failed";
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, output, .{}) catch |err| return switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        else => "Failed",
+    };
+    defer parsed.deinit();
+    if (parsed.value != .object) return "Failed";
+    const ok = parsed.value.object.get("ok") orelse return "Failed";
+    if (ok != .bool or ok.bool) return "Failed";
+    const code = tool_args.optionalStringArg(parsed.value.object, "error_code") orelse return "Failed";
+    return if (std.mem.eql(u8, code, "child_cancelled") or std.mem.eql(u8, code, "child_interrupted")) "Interrupted" else "Failed";
+}
+
+test "subagent rows project request identity state and bounded safe previews" {
+    const alloc = std.testing.allocator;
+    const cases = [_]struct { args: []const u8, state: SubagentActionState, label: []const u8, detail: []const u8 }{
+        .{ .args = "{\"request\":{\"action\":\"run\",\"task\":\" Check\\n cancellation\\tcleanup \"}}", .state = .active, .label = "Subagent working", .detail = "· Check cancellation cleanup" },
+        .{ .args = "{\"action\":\"run\",\"task\":\"Check cleanup\"}", .state = .completed, .label = "Subagent finished", .detail = "· Check cleanup" },
+        .{ .args = "{\"request\":{\"action\":\"message\",\"agent\":\"reviewer\",\"message\":\"Check replay\",\"instructions\":\"Never display this\"}}", .state = .completed, .label = "reviewer replied", .detail = "· Check replay" },
+        .{ .args = "{\"action\":\"message\",\"agent\":\"reviewer\",\"message\":\"Check again\"}", .state = .{ .stopped = "Failed" }, .label = "reviewer failed", .detail = "· Check again" },
+        .{ .args = "{\"action\":\"message\",\"agent\":\"reviewer\",\"message\":\"Check again\"}", .state = .{ .stopped = "Cancelled" }, .label = "reviewer interrupted", .detail = "· Check again" },
+        .{ .args = "{\"action\":\"run\",\"task\":\"Check again\"}", .state = .{ .stopped = "Denied" }, .label = "Denied Subagent", .detail = "· Check again" },
+    };
+    for (cases) |case| {
+        const action = (try subagentAction(alloc, .{ .id = "child", .name = "subagent", .arguments_json = case.args }, case.state)).?;
+        defer action.deinit(alloc);
+        try std.testing.expectEqualStrings(case.label, action.label);
+        try std.testing.expectEqualStrings(case.detail, action.detail);
+    }
+    for ([_][]const u8{ "{", "[]", "{\"request\":null}", "{\"action\":\"inspect\"}", "{\"action\":\"message\",\"message\":\"hello\"}" }) |args| {
+        try std.testing.expectEqual(@as(?SubagentAction, null), try subagentAction(alloc, .{ .id = "child", .name = "subagent", .arguments_json = args }, .active));
+    }
+    const unsafe = (try subagentAction(alloc, .{ .id = "child", .name = "subagent", .arguments_json = "{\"action\":\"message\",\"agent\":\"a\\u001b[2J\",\"message\":\"Check 日本語\\u001b[31m\"}" }, .active)).?;
+    defer unsafe.deinit(alloc);
+    try std.testing.expect(text_utils.isTerminalSafe(unsafe.label));
+    try std.testing.expect(text_utils.isTerminalSafe(unsafe.detail));
+    try std.testing.expect(std.mem.find(u8, unsafe.detail, "日本語") != null);
+    const long = try subagentPreview(alloc, "日本語" ** 100);
+    defer alloc.free(long);
+    try std.testing.expect(long.len <= 120);
+    try std.testing.expect(text_utils.isTerminalSafe(long));
+    try std.testing.expect(std.mem.endsWith(u8, long, "..."));
+}
+
+test "subagent failure labels trust structured terminal codes only" {
+    const alloc = std.testing.allocator;
+    const call: ToolCall = .{ .id = "child", .name = "subagent", .arguments_json = "{}" };
+    try std.testing.expectEqualStrings("Interrupted", try subagentFailureLabel(alloc, call, "{\"ok\":false,\"error_code\":\"child_interrupted\"}"));
+    try std.testing.expectEqualStrings("Interrupted", try subagentFailureLabel(alloc, call, "{\"ok\":false,\"error_code\":\"child_cancelled\"}"));
+    for ([_][]const u8{ "child_interrupted", "{", "<tool_result_preview>child_interrupted</tool_result_preview>", "{\"ok\":true,\"error_code\":\"child_interrupted\"}", "{\"ok\":false,\"error_code\":\"child_failed\"}" }) |output| {
+        try std.testing.expectEqualStrings("Failed", try subagentFailureLabel(alloc, call, output));
+    }
+}
+
+/// The caller owns the returned plain subagent row.
+pub fn formatSubagentPlainAction(alloc: Allocator, call: ToolCall, state: SubagentActionState) Allocator.Error!?[]u8 {
+    const action = try subagentAction(alloc, call, state) orelse return null;
+    defer action.deinit(alloc);
+    return try std.fmt.allocPrint(alloc, "{s}{s}{s}", .{ action.label, if (action.detail.len == 0) "" else " ", action.detail });
+}
 
 pub const RunCommandActivity = struct {
     detail: []const u8,
@@ -290,6 +440,7 @@ pub fn resolveTerminalDisplayTarget(
     registry: tool_dispatch.Registry,
     workspace_root: []const u8,
     terminal_client: ?*terminal_client_runtime.Runtime,
+    managed_executions: ?*managed_execution.Runtime,
     call: ToolCall,
 ) !?[]const u8 {
     var scratch_state = std.heap.ArenaAllocator.init(std.heap.c_allocator);
@@ -299,6 +450,12 @@ pub fn resolveTerminalDisplayTarget(
         registry,
         call,
     ) orelse return null;
+    if (managed_executions) |executions| {
+        if (try executions.captured_command_alloc(alloc, session_id)) |command| {
+            defer alloc.free(command);
+            if (command.len != 0) return try formatTerminalDisplayTarget(alloc, workspace_root, command);
+        }
+    }
     const runtime = terminal_client orelse return @as(?[]const u8, try resolveTerminalSessionTargetFromRows(
         alloc,
         workspace_root,
@@ -335,9 +492,19 @@ fn formatTerminalDisplayTarget(
     return encoded.bytes;
 }
 
+/// Borrows the name from the prepared action without replacing resource labels.
+pub fn resolvedSkillName(call: ToolCall, presentation: tool_dispatch.CallPresentation) ?[]const u8 {
+    if (presentation.label_arg_kind != .name) return null;
+    const selected = call.resolved_skill orelse return null;
+    return selected.skill.name;
+}
+
 /// The caller owns the returned allocation and must free it with `alloc`.
 pub fn formatPlainAction(alloc: Allocator, input: ToolActionInput) ![]const u8 {
     const call = input.call;
+    if (input.tool_registry.lookup(call.name) != null) {
+        if (try formatSubagentPlainAction(alloc, call, .active)) |line| return line;
+    }
     if (file_mutation_contract.isToolName(call.name)) {
         const spec = input.tool_registry.lookup(call.name) orelse
             return std.fmt.allocPrint(alloc, "Working: {s}", .{call.name});
@@ -377,6 +544,7 @@ pub fn formatPlainAction(alloc: Allocator, input: ToolActionInput) ![]const u8 {
         return std.fmt.allocPrint(alloc, "{s} {s}", .{ presentation.action_label, try formatWebSearchActionDetail(scratch, args) });
     }
     const value = input.display_target orelse
+        resolvedSkillName(call, presentation) orelse
         tool_dispatch.presentationLabelValue(presentation, args) orelse
         presentation.label_arg_default;
     return std.fmt.allocPrint(alloc, "{s} {s}", .{ presentation.action_label, value });
@@ -940,6 +1108,103 @@ test "tool presentation preserves plain action fallbacks" {
         defer alloc.free(label);
         try std.testing.expectEqualStrings(case.expected, label);
     }
+}
+
+test "tool presentation uses the resolved skill name for location calls" {
+    const alloc = std.testing.allocator;
+    const selected: @import("../skills/skill_contract.zig").PreparedSkill = .{ .skill = .{
+        .name = "workflow",
+        .description = "",
+        .path = "/skills/different-directory",
+        .source = .workspace_fx,
+    } };
+    const cases = [_]struct { args: []const u8, expected: []const u8 }{
+        .{ .args = "{\"location\":\"skill:0000000000000001:0/different-directory\"}", .expected = "Loading skill workflow" },
+        .{ .args = "{\"location\":\"/skills/different-directory\",\"resource\":\"SKILL.md\"}", .expected = "Loading skill workflow" },
+        .{ .args = "{\"location\":\"/skills/different-directory\",\"resource\":\"references/rules.md\"}", .expected = "Reading skill resource references/rules.md" },
+    };
+    for (cases) |case| {
+        const label = try formatPlainAction(alloc, .{
+            .tool_registry = test_tool_registry,
+            .call = .{ .id = "load", .name = "skill", .arguments_json = case.args, .resolved_skill = &selected },
+        });
+        defer alloc.free(label);
+        try std.testing.expectEqualStrings(case.expected, label);
+    }
+}
+
+test "captured display target uses retained command without consuming output" {
+    if (comptime builtin.os.tag == .wasi) return;
+    const alloc = std.testing.allocator;
+    var executions = managed_execution.Runtime.init(alloc);
+    defer executions.deinit();
+    const command = "printf LABEL";
+    const admission = @import("../permissions/command_admission.zig");
+    var started = try executions.startCaptured(alloc, .{
+        .execution_id = "shell-label",
+        .command = command,
+        .cwd = "/tmp",
+        .environment = .legacy,
+        .authority = .{ .shell_allowed = .{
+            .fingerprint = .init(admission.CommandContext{
+                .command = command,
+                .resolved_cwd = "/tmp",
+                .target_os = builtin.os.tag,
+                .environment = .legacy,
+            }),
+            .source = .yolo,
+        } },
+        .max_output_bytes = 4096,
+        .timeout_ms = 2_000,
+        .command_artifact_dir = null,
+        .yield_time_ms = 0,
+    });
+    defer started.deinit(alloc);
+    try executions.commitDelivery(started.snapshot.execution_id, started.reservation_id);
+    const call = ToolCall{
+        .id = "observe",
+        .name = "shell",
+        .arguments_json = "{\"action\":\"interact\",\"session_id\":\"shell-label\"}",
+    };
+    const target = (try resolveTerminalDisplayTarget(alloc, test_tool_registry, "/tmp", null, &executions, call)).?;
+    defer alloc.free(target);
+    try std.testing.expectEqualStrings(command, target);
+    const label = try formatPlainAction(alloc, .{
+        .tool_registry = test_tool_registry,
+        .call = call,
+        .display_target = target,
+    });
+    defer alloc.free(label);
+    try std.testing.expectEqualStrings("Waiting for printf LABEL", label);
+
+    var completed = try executions.wait(alloc, "shell-label", 2_000, null);
+    defer completed.deinit(alloc);
+    try std.testing.expectEqualStrings("LABEL", completed.snapshot.output_delta);
+    try executions.commitDelivery(completed.snapshot.execution_id, completed.reservation_id);
+    const retained = (try resolveTerminalDisplayTarget(alloc, test_tool_registry, "/tmp", null, &executions, call)).?;
+    defer alloc.free(retained);
+    try std.testing.expectEqualStrings(command, retained);
+    try std.testing.expectEqualStrings(command, target);
+
+    const missing = (try resolveTerminalDisplayTarget(alloc, test_tool_registry, "/tmp", null, &executions, .{
+        .id = "missing",
+        .name = "shell",
+        .arguments_json = "{\"action\":\"stop\",\"session_id\":\"shell-missing\"}",
+    })).?;
+    defer alloc.free(missing);
+    try std.testing.expectEqualStrings("session shell-missing", missing);
+}
+
+test "terminal display target bounds and sanitizes command metadata" {
+    const alloc = std.testing.allocator;
+    const target = try formatTerminalDisplayTarget(alloc, "/tmp/workspace", "/tmp/workspace/build\n\x1b[31m" ++ ("é" ** 120));
+    defer alloc.free(target);
+    try std.testing.expect(std.mem.startsWith(u8, target, "./build "));
+    try std.testing.expect(target.len <= max_run_command_activity_bytes);
+    try std.testing.expect(std.mem.findScalar(u8, target, '\x1b') == null);
+    try std.testing.expect(std.mem.findScalar(u8, target, '\n') == null);
+    try std.testing.expect(std.unicode.utf8ValidateSlice(target));
+    try std.testing.expect(std.mem.endsWith(u8, target, "..."));
 }
 
 test "terminal display target is call-local across a cold inspect projection update" {

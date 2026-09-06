@@ -19,14 +19,16 @@ if (!new Set(["native", "wasm"]).has(backend) || !Number.isInteger(samples) || s
 const root = resolve(fileURLToPath(new URL("../..", import.meta.url)));
 const stages = [];
 let requestIndex = 0;
+let catalogRequests = 0;
 const server = createServer((request, response) => {
   let body = "";
   request.setEncoding("utf8");
   request.on("data", (chunk) => { body += chunk; });
   request.on("end", () => {
     if (request.method === "GET") {
+      catalogRequests += 1;
       response.writeHead(200, { "content-type": "application/json" });
-      response.end('{"object":"list","data":[]}');
+      response.end('{"object":"list","data":[{"id":"bridge/model","type":"language","tags":["tool-use"]}]}');
       return;
     }
     const sample = Math.floor(requestIndex / 2);
@@ -49,8 +51,10 @@ let activeSample = 0;
 const agent = await createFxAgent({
   backend,
   nativeAddon: resolve(root, "zig-out/lib/libfx.node"),
-  ...(backend === "wasm" ? { wasm: await readFile(resolve(root, "zig-out/bin/fx-core.wasm")) } : {}),
-  fetch,
+  ...(backend === "wasm" ? { wasm: await readFile(resolve(root, "zig-out/bin/omfx-core.wasm")) } : {}),
+  fetch(input, init) {
+    return fetch(init.method === "GET" ? `http://127.0.0.1:${server.address().port}/models` : input, init);
+  },
   tools: [{
     name: "bridge_echo",
     description: "Measure the host tool bridge",
@@ -76,11 +80,13 @@ try {
     callback_to_followup_fetch_ms: stage.followup_fetch_at - stage.callback_at,
     tool_round_trip_ms: stage.followup_fetch_at - stage.tool_event_at,
   }));
+  if (catalogRequests !== 1 || requestIndex !== 2 * samples) throw new Error("unexpected bridge request counts");
   process.stdout.write(`${JSON.stringify({
     format_version: 1,
     runtime: typeof Bun === "undefined" ? "node" : "bun",
     runtime_version: typeof Bun === "undefined" ? process.version : Bun.version,
     backend,
+    non_prompt_fetches: catalogRequests,
     samples: report,
   }, null, 2)}\n`);
 } finally {

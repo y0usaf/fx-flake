@@ -156,7 +156,7 @@ pub const ReadyCallBatch = struct {
 /// Classifies one effective `.ready` lifecycle call without permission,
 /// presentation, execution, or product-state mutation.
 pub fn prepareReadyCall(alloc: Allocator, call: ToolCall, config: Config) !Result {
-    if (call.provenance == .provider_executed or call.argument_integrity == .malformed_json) {
+    if (call.provenance == .provider_executed or call.argument_integrity != .valid) {
         return error.NotLifecycleReady;
     }
     try checkCancellation(config.cancel_flag);

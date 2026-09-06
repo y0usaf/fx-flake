@@ -262,6 +262,34 @@ fn isSupportedForOs(os_tag: std.Target.Os.Tag) bool {
     return host_capabilities.terminalSupportForOs(os_tag).isSupported();
 }
 
+test "native terminal backend selection follows canonical platform support" {
+    const os_tags = [_]std.Target.Os.Tag{
+        .macos,
+        .linux,
+        .windows,
+        .wasi,
+        .freebsd,
+        .emscripten,
+    };
+    for (os_tags) |os_tag| {
+        try std.testing.expectEqual(
+            host_capabilities.terminalSupportForOs(os_tag).isSupported(),
+            isSupportedForOs(os_tag),
+        );
+    }
+    try std.testing.expectEqual(isSupportedForOs(builtin.os.tag), isSupported());
+    const ExpectedRegistry = if (comptime host_capabilities
+        .terminalSupportForOs(builtin.os.tag)
+        .isSupported())
+        SupportedRegistry
+    else
+        UnsupportedRegistry;
+    try std.testing.expectEqualStrings(
+        @typeName(ExpectedRegistry),
+        @typeName(Registry),
+    );
+}
+
 pub fn isLauncherModeRaw(raw_args: []const [*:0]const u8) bool {
     return raw_args.len == 2 and
         std.mem.eql(u8, std.mem.sliceTo(raw_args[1], 0), launcher_mode);
@@ -555,6 +583,25 @@ fn launcherStatusToTerm(raw_status: u32) std.process.Child.Term {
         .{ .stopped = std.c.W.STOPSIG(raw_status) }
     else
         .{ .unknown = raw_status };
+}
+
+test "launcher wait status classifies terminal results before stops" {
+    try std.testing.expectEqual(
+        std.process.Child.Term{ .exited = 23 },
+        launcherStatusToTerm(23 << 8),
+    );
+    try std.testing.expectEqual(
+        std.process.Child.Term{ .signal = .TERM },
+        launcherStatusToTerm(@intFromEnum(std.c.SIG.TERM)),
+    );
+    try std.testing.expectEqual(
+        std.process.Child.Term{ .signal = .SEGV },
+        launcherStatusToTerm(@intFromEnum(std.c.SIG.SEGV) | 0x80),
+    );
+    try std.testing.expectEqual(
+        std.process.Child.Term{ .stopped = .TTIN },
+        launcherStatusToTerm((@as(u32, @intFromEnum(std.c.SIG.TTIN)) << 8) | 0x7f),
+    );
 }
 
 fn waitLauncherChild(child: *std.process.Child) !std.process.Child.Term {
@@ -1038,6 +1085,7 @@ const SupportedRegistry = struct {
                 .start,
                 switch (err) {
                     error.CapacityExceeded => .capacity_exceeded,
+                    error.MissingLoginShell => .shell_unavailable,
                     error.RelativeShellPath,
                     error.UnsupportedShell,
                     => .invalid_request,
@@ -3202,6 +3250,15 @@ noinline fn failReconstructedGridDynamic(err: anyerror) anyerror!terminal_engine
     return err;
 }
 
+test "reconstructed grid failures preserve exact error types and identities" {
+    const corrupt = failReconstructedGrid(error.ScreenCorrupt);
+    try std.testing.expect(
+        @TypeOf(corrupt) == error{ScreenCorrupt}!terminal_engine.Grid,
+    );
+    try std.testing.expectError(error.ScreenCorrupt, corrupt);
+    try std.testing.expectError(error.OutOfMemory, failReconstructedGrid(error.OutOfMemory));
+}
+
 fn reconstructEngine(
     alloc: Allocator,
     durable: *terminal_store.DurableSession,
@@ -3867,6 +3924,30 @@ fn processGroupMissing(pid: std.posix.pid_t) bool {
     };
 }
 
+test "running tmux recovery does not pause the published process group" {
+    try std.testing.expect(!shouldPauseRecoveredTmuxProcess(
+        .running,
+        false,
+        true,
+    ));
+    try std.testing.expect(shouldPauseRecoveredTmuxProcess(
+        .starting,
+        false,
+        true,
+    ));
+}
+
+test "terminal signaling accepts a process group that exited during descendant delivery" {
+    try std.testing.expect(terminalSignalCompleted(
+        .{ .delivered = 1 },
+        .missing,
+    ));
+    try std.testing.expect(!terminalSignalCompleted(
+        .{ .delivered = 1, .incomplete = true },
+        .missing,
+    ));
+}
+
 fn failSignalStageForTest(stage: []const u8) bool {
     const requested = io_mod.getenv("FX_TERMINAL_TEST_FAIL_SIGNAL_STAGE") orelse
         return false;
@@ -4025,6 +4106,23 @@ fn openPty() !Pty {
         0,
     );
     return .{ .master = master, .slave = slave };
+}
+
+test "PTY output drains use a nonblocking master" {
+    if (comptime !isSupported()) return;
+    const pty = try openPty();
+    defer closeFd(pty.master);
+    defer closeFd(pty.slave);
+
+    const result = std.posix.system.fcntl(
+        pty.master,
+        std.posix.F.GETFL,
+        @as(usize, 0),
+    );
+    try std.testing.expectEqual(std.posix.E.SUCCESS, std.posix.errno(result));
+    const flags: usize = @intCast(result);
+    const nonblocking = @as(usize, 1) << @bitOffsetOf(std.posix.O, "NONBLOCK");
+    try std.testing.expect(flags & nonblocking != 0);
 }
 
 fn resizeFd(fd: std.posix.fd_t, dimensions: contracts.Dimensions) !void {
@@ -4562,6 +4660,87 @@ fn keySequence(key: contracts.NamedKey) []const u8 {
     };
 }
 
+test "write payload encoding preserves text paste keys and controls" {
+    const alloc = std.testing.allocator;
+    var text = try encodeWritePayload(alloc, .{ .text = "a\x00b" });
+    defer text.deinit(alloc);
+    try std.testing.expectEqualSlices(u8, "a\x00b", text.items);
+
+    var paste = try encodeWritePayload(alloc, .{ .paste = "\xff\n" });
+    defer paste.deinit(alloc);
+    try std.testing.expectEqualSlices(u8, "\xff\n", paste.items);
+
+    var keys = try encodeWritePayload(
+        alloc,
+        .{ .keys = &.{
+            .enter,
+            .tab,
+            .escape,
+            .backspace,
+            .delete,
+            .insert,
+            .arrow_up,
+            .arrow_down,
+            .arrow_left,
+            .arrow_right,
+            .home,
+            .end,
+            .page_up,
+            .page_down,
+        } },
+    );
+    defer keys.deinit(alloc);
+    try std.testing.expectEqualSlices(
+        u8,
+        "\r\t\x1b\x7f\x1b[3~\x1b[2~\x1b[A\x1b[B\x1b[D\x1b[C\x1b[H\x1b[F\x1b[5~\x1b[6~",
+        keys.items,
+    );
+
+    var controls = try encodeWritePayload(
+        alloc,
+        .{ .controls = &.{
+            .{ .character = 'c' },
+            .{ .character = '?' },
+        } },
+    );
+    defer controls.deinit(alloc);
+    try std.testing.expectEqualSlices(u8, &.{ 3, 0x7f }, controls.items);
+}
+
+test "terminal outcomes preserve exact exit and signal status" {
+    try std.testing.expectEqual(
+        contracts.ReturnOutcome{ .exited = 23 },
+        outcomeFromTerm(.{ .exited = 23 }).?,
+    );
+    try std.testing.expectEqual(
+        contracts.ReturnOutcome{ .signal = @intFromEnum(std.posix.SIG.TERM) },
+        outcomeFromTerm(.{ .signal = .TERM }).?,
+    );
+    try std.testing.expect(outcomeFromTerm(.{ .unknown = 1 }) == null);
+    try std.testing.expect(outcomeFromTerm(.{ .stopped = .STOP }) == null);
+    try std.testing.expectEqual(
+        std.posix.SIG.SEGV,
+        signalFromInt(@intFromEnum(std.posix.SIG.SEGV)).?,
+    );
+    try std.testing.expect(signalFromInt(0) == null);
+    try std.testing.expect(signalFromInt(256) == null);
+}
+
+test "terminal signal completion requires checked descendants and shell group" {
+    try std.testing.expect(terminalSignalCompleted(.{}, .delivered));
+    try std.testing.expect(!terminalSignalCompleted(.{
+        .delivered = 1,
+        .incomplete = true,
+    }, .delivered));
+    try std.testing.expect(!terminalSignalCompleted(.{}, .failed));
+}
+
+test "force close fallback does not erase an incomplete tree operation" {
+    try std.testing.expect(!forceCloseSignalIncomplete(true));
+    try std.testing.expect(forceCloseSignalIncomplete(false));
+    try std.testing.expect(forceCloseSignalIncomplete(null));
+}
+
 fn ignoreWorkUpdate(_: ?*anyopaque, _: bool) void {}
 
 const WorkProbe = struct {
@@ -4662,4 +4841,890 @@ fn checkSessionInitAllocationFailures(alloc: Allocator) !void {
     );
     id_owned = false;
     defer session.deinitUnlaunched();
+}
+
+test "session initialization owns durable resources" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        checkSessionInitAllocationFailures,
+        .{},
+    );
+}
+
+test "recovered session owns the saved workspace scope" {
+    const alloc = std.testing.allocator;
+    var fixture = try TestDurableFixture.init(alloc);
+    defer fixture.deinit();
+    var persistence = testPersistence("/saved-workspace/cwd");
+    persistence.grant.principal.workspace_root = "/saved-workspace";
+    persistence.grant.principal.backend = .tmux;
+    const durable = try terminal_store.DurableSession.create(&fixture.profile, .{
+        .session_id = "terminal-recovered-scope",
+        .host_identity = "test-host",
+        .shell = "/bin/zsh",
+        .cwd = "/saved-workspace/cwd",
+        .command = "printf ready",
+        .backend = .tmux,
+        .dimensions = .{ .rows = 24, .columns = 80 },
+        .persistence = persistence,
+        .now_ms = 1,
+    });
+    var session = try Session.initRecovered(
+        alloc,
+        .{ .context = null, .update_fn = ignoreWorkUpdate },
+        durable,
+    );
+    defer session.deinitUnlaunched();
+
+    try std.testing.expectEqualStrings("/saved-workspace", session.workspace_root);
+    try std.testing.expectEqualStrings("/saved-workspace/cwd", session.cwd);
+}
+
+test "terminal state does not release live work before backend cleanup" {
+    const alloc = std.testing.allocator;
+    var fixture = try TestDurableFixture.init(alloc);
+    defer fixture.deinit();
+    const id = try alloc.dupe(u8, "terminal-live-cleanup");
+    var probe: WorkProbe = .{};
+    var session = try Session.init(
+        alloc,
+        .{ .context = &probe, .update_fn = WorkProbe.update },
+        &fixture.profile,
+        "test-host",
+        id,
+        .{
+            .cwd = "/workspace",
+            .shell = .{ .executable = .{ .path = "/bin/zsh" } },
+        },
+        testPersistence("/workspace"),
+    );
+    defer session.deinitUnlaunched();
+
+    session.markLive();
+    session.lifecycle = .running;
+    session.setTerm(.{ .exited = 0 });
+    try std.testing.expectEqual(@as(isize, 1), probe.live);
+    try std.testing.expect(!session.isRecyclable());
+
+    session.markNotLive();
+    try std.testing.expectEqual(@as(isize, 0), probe.live);
+    try std.testing.expect(session.isRecyclable());
+    session.markNotLive();
+    try std.testing.expectEqual(@as(usize, 2), probe.updates);
+}
+
+test "durable journal preserves startup matches" {
+    const alloc = std.testing.allocator;
+    var fixture = try TestDurableFixture.init(alloc);
+    defer fixture.deinit();
+    const id = try alloc.dupe(u8, "terminal-retention");
+    var session = try Session.init(
+        alloc,
+        .{ .context = null, .update_fn = ignoreWorkUpdate },
+        &fixture.profile,
+        "test-host",
+        id,
+        .{
+            .cwd = "/workspace",
+            .command = "printf ready",
+            .shell = .{ .executable = .{ .path = "/bin/zsh" } },
+            .return_when = .{ .match = "ready" },
+        },
+        testPersistence("/workspace"),
+    );
+    defer session.deinitUnlaunched();
+
+    session.command_start_cursor = .{ .segment = 1, .offset = 0 };
+    session.lifecycle = .running;
+    session.appendOutput("ready");
+    const noise: [64]u8 = @splat('x');
+    session.appendOutput(&noise);
+    try std.testing.expectEqual(@as(u64, 1), session.durable.record.output_cursor.segment);
+    try std.testing.expect(session.startup_match_seen);
+    try std.testing.expectEqual(
+        contracts.ReturnOutcome.condition_met,
+        session.matchConditionLocked(.{ .match = "ready" }, io_mod.milliTimestamp()).?,
+    );
+}
+
+test "command start match ignores profile output before its cursor" {
+    const alloc = std.testing.allocator;
+    var fixture = try TestDurableFixture.init(alloc);
+    defer fixture.deinit();
+    const id = try alloc.dupe(u8, "terminal-command-boundary");
+    var session = try Session.init(
+        alloc,
+        .{ .context = null, .update_fn = ignoreWorkUpdate },
+        &fixture.profile,
+        "test-host",
+        id,
+        .{
+            .cwd = "/workspace",
+            .command = "printf boundary-match",
+            .shell = .{ .executable = .{ .path = "/bin/zsh" } },
+            .return_when = .{ .match = "boundary-match" },
+        },
+        testPersistence("/workspace"),
+    );
+    defer session.deinitUnlaunched();
+
+    session.appendOutput("profile boundary-match\n");
+    try std.testing.expect(!session.startup_match_seen);
+    try std.testing.expect(session.matchConditionLocked(
+        .{ .match = "boundary-match" },
+        io_mod.milliTimestamp(),
+    ) == null);
+
+    session.command_start_cursor = session.durable.record.output_cursor;
+    session.last_output_ms = io_mod.milliTimestamp();
+    session.lifecycle = .running;
+    session.appendOutput("target boundary-match\n");
+    try std.testing.expect(session.startup_match_seen);
+    try std.testing.expectEqual(
+        contracts.ReturnOutcome.condition_met,
+        session.matchConditionLocked(
+            .{ .match = "boundary-match" },
+            io_mod.milliTimestamp(),
+        ).?,
+    );
+}
+
+test "split partial bytes remain opaque and ordered" {
+    const alloc = std.testing.allocator;
+    var fixture = try TestDurableFixture.init(alloc);
+    defer fixture.deinit();
+    const id = try alloc.dupe(u8, "terminal-partial-bytes");
+    var session = try Session.init(
+        alloc,
+        .{ .context = null, .update_fn = ignoreWorkUpdate },
+        &fixture.profile,
+        "test-host",
+        id,
+        .{
+            .cwd = "/workspace",
+            .shell = .{ .executable = .{ .path = "/bin/zsh" } },
+        },
+        testPersistence("/workspace"),
+    );
+    defer session.deinitUnlaunched();
+
+    session.appendOutput(&.{ 0xf0, 0x9f });
+    session.appendOutput(&.{0x92});
+    session.appendOutput(&.{ 0xa9, 0x00, 0xff });
+    var page = try session.durable.read(
+        alloc,
+        .{ .segment = 1, .offset = 0 },
+        16,
+    );
+    defer page.deinit(alloc);
+    try std.testing.expectEqualSlices(
+        u8,
+        &.{ 0xf0, 0x9f, 0x92, 0xa9, 0x00, 0xff },
+        page.output,
+    );
+    try std.testing.expectEqual(
+        contracts.RawCursor{ .segment = 1, .offset = 6 },
+        session.durable.record.output_cursor,
+    );
+}
+
+test "checkpoint plus contiguous observational replay equals live screen" {
+    const alloc = std.testing.allocator;
+    var fixture = try TestDurableFixture.init(alloc);
+    defer fixture.deinit();
+    const id = try alloc.dupe(u8, "terminal-screen-replay");
+    var session = try Session.init(
+        alloc,
+        .{ .context = null, .update_fn = ignoreWorkUpdate },
+        &fixture.profile,
+        "test-host",
+        id,
+        .{
+            .cwd = "/workspace",
+            .shell = .{ .executable = .{ .path = "/bin/zsh" } },
+            .dimensions = .{ .rows = 4, .columns = 12 },
+        },
+        testPersistence("/workspace"),
+    );
+    defer session.deinitUnlaunched();
+
+    session.appendOutput("hello\x1b[2;");
+    const checkpoint_cursor = session.durable.record.output_cursor;
+    try session.checkpointLocked(checkpoint_cursor, io_mod.milliTimestamp());
+    try session.durable.append("3H\xe7\x95\x8c\x1b[6n", io_mod.milliTimestamp());
+    var live_result = try session.engine.feedMode(
+        "3H\xe7\x95\x8c\x1b[6n",
+        .native_live,
+    );
+    defer live_result.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), live_result.replies.items.len);
+    try std.testing.expectEqual(
+        checkpoint_cursor,
+        switch (session.durable.record.screen_recovery) {
+            .available => |envelope| envelope.applied_cursor,
+            .unavailable => return error.TestUnexpectedResult,
+        },
+    );
+
+    var recovered = try reconstructEngine(alloc, &session.durable);
+    defer recovered.deinit();
+    const live_payload = try session.engine.checkpointPayload(alloc);
+    defer alloc.free(live_payload);
+    const recovered_payload = try recovered.checkpointPayload(alloc);
+    defer alloc.free(recovered_payload);
+    try std.testing.expectEqualSlices(u8, live_payload, recovered_payload);
+
+    const unavailable_from = contracts.RawCursor{
+        .segment = checkpoint_cursor.segment,
+        .offset = checkpoint_cursor.offset + 1,
+    };
+    session.durable.record.available_from = unavailable_from;
+    session.durable.record.raw_gap = .{
+        .missing_from = checkpoint_cursor,
+        .available_from = unavailable_from,
+    };
+    session.durable.record.journal_files[0].range.start = unavailable_from;
+    session.durable.record.journal_files[0].payload_bytes =
+        session.durable.record.output_cursor.offset - unavailable_from.offset;
+    session.durable.record.journal_payload_bytes =
+        session.durable.record.journal_files[0].payload_bytes;
+    try std.testing.expectError(
+        error.ScreenRawGap,
+        reconstructEngine(alloc, &session.durable),
+    );
+    try std.testing.expectEqual(
+        contracts.ScreenRecovery{ .unavailable = .raw_gap },
+        session.durable.facts().screen_recovery,
+    );
+}
+
+test "many small output chunks checkpoint only at store boundaries" {
+    const alloc = std.testing.allocator;
+    var fixture = try TestDurableFixture.init(alloc);
+    defer fixture.deinit();
+    const id = try alloc.dupe(u8, "terminal-checkpoint-boundary");
+    var session = try Session.init(
+        alloc,
+        .{ .context = null, .update_fn = ignoreWorkUpdate },
+        &fixture.profile,
+        "test-host",
+        id,
+        .{
+            .cwd = "/workspace",
+            .shell = .{ .executable = .{ .path = "/bin/zsh" } },
+        },
+        testPersistence("/workspace"),
+    );
+    defer session.deinitUnlaunched();
+    var sink = try std.Io.Dir.openFileAbsolute(
+        std.testing.io,
+        "/dev/null",
+        .{ .mode = .write_only },
+    );
+    defer sink.close(std.testing.io);
+    session.master_fd = sink.handle;
+
+    for (0..64) |_| session.appendOutput("x");
+    try std.testing.expectEqual(
+        @as(u64, 0),
+        session.durable.record.checkpoint_generation,
+    );
+
+    const block: [256 * 1024]u8 = @splat('y');
+    for (0..4) |_| session.appendOutput(&block);
+    try std.testing.expectEqual(
+        @as(u64, 1),
+        session.durable.record.checkpoint_generation,
+    );
+    try std.testing.expectEqual(
+        session.durable.record.output_cursor,
+        switch (session.durable.record.screen_recovery) {
+            .available => |checkpoint| checkpoint.applied_cursor,
+            .unavailable => return error.TestUnexpectedResult,
+        },
+    );
+
+    for (0..64) |_| session.appendOutput("z");
+    try std.testing.expectEqual(
+        @as(u64, 1),
+        session.durable.record.checkpoint_generation,
+    );
+}
+
+test "resize recovery never reflows raw output at final dimensions" {
+    const alloc = std.testing.allocator;
+    var fixture = try TestDurableFixture.init(alloc);
+    defer fixture.deinit();
+    const id = try alloc.dupe(u8, "terminal-resize-recovery");
+    var session = try Session.init(
+        alloc,
+        .{ .context = null, .update_fn = ignoreWorkUpdate },
+        &fixture.profile,
+        "test-host",
+        id,
+        .{
+            .cwd = "/workspace",
+            .shell = .{ .executable = .{ .path = "/bin/zsh" } },
+            .dimensions = .{ .rows = 2, .columns = 4 },
+        },
+        testPersistence("/workspace"),
+    );
+    var session_owned = true;
+    defer if (session_owned) session.deinitUnlaunched();
+
+    try session.durable.append("abcdef", 2);
+    var feed = try session.engine.feedMode("abcdef", .native_live);
+    feed.deinit(alloc);
+    var row: std.ArrayList(u8) = .empty;
+    defer row.deinit(alloc);
+    try session.engine.rowTextTrimmed(1, &row);
+    try std.testing.expectEqualStrings("abcd", row.items);
+    row.clearRetainingCapacity();
+    try session.engine.rowTextTrimmed(2, &row);
+    try std.testing.expectEqualStrings("ef", row.items);
+
+    const resized = contracts.Dimensions{ .rows = 2, .columns = 6 };
+    try session.engine.resize(resized.columns, resized.rows);
+    try session.durable.resize(resized, 3);
+    session.dimensions = resized;
+    try session.checkpointLocked(session.durable.output_cursor(), 4);
+
+    var recovered = try reconstructEngine(alloc, &session.durable);
+    defer recovered.deinit();
+    const live_payload = try session.engine.checkpointPayload(alloc);
+    defer alloc.free(live_payload);
+    const recovered_payload = try recovered.checkpointPayload(alloc);
+    defer alloc.free(recovered_payload);
+    try std.testing.expectEqualSlices(u8, live_payload, recovered_payload);
+
+    var raw_at_final_size = try terminal_engine.Grid.init(
+        alloc,
+        resized.columns,
+        resized.rows,
+    );
+    defer raw_at_final_size.deinit();
+    var raw_feed = try raw_at_final_size.feedMode("abcdef", .journal_replay);
+    raw_feed.deinit(alloc);
+    row.clearRetainingCapacity();
+    try raw_at_final_size.rowTextTrimmed(1, &row);
+    try std.testing.expectEqualStrings("abcdef", row.items);
+    row.clearRetainingCapacity();
+    try session.engine.rowTextTrimmed(1, &row);
+    try std.testing.expectEqualStrings("abcd", row.items);
+
+    try session.durable.store_checkpoint(.{
+        .engine_schema_revision = terminal_engine.checkpoint_schema_revision + 1,
+        .applied_cursor = session.durable.output_cursor(),
+        .payload_len = @intCast(live_payload.len),
+        .checksum = contracts.checkpoint_checksum(live_payload),
+    }, live_payload, 5);
+    try std.testing.expect(!session.durable.record.raw_replay_exact);
+    try std.testing.expectError(
+        error.ScreenUnsupported,
+        reconstructEngine(alloc, &session.durable),
+    );
+    try std.testing.expectEqual(
+        contracts.ScreenRecovery{ .unavailable = .unsupported_schema },
+        session.durable.facts().screen_recovery,
+    );
+
+    session.deinitUnlaunched();
+    session_owned = false;
+    const reopened = try fixture.profile.open_terminal(
+        "terminal-resize-recovery",
+    );
+    defer fixture.profile.release_terminal(reopened);
+    try std.testing.expectEqual(resized, reopened.record.dimensions);
+    try std.testing.expect(!reopened.record.raw_replay_exact);
+    try std.testing.expectEqual(
+        contracts.ScreenRecovery{ .unavailable = .unsupported_schema },
+        reopened.facts().screen_recovery,
+    );
+}
+
+test "native protocol replies are independent of either durable write lease" {
+    const alloc = std.testing.allocator;
+    var fixture = try TestDurableFixture.init(alloc);
+    defer fixture.deinit();
+    const id = try alloc.dupe(u8, "terminal-reply-leases");
+    var session = try Session.init(
+        alloc,
+        .{ .context = null, .update_fn = ignoreWorkUpdate },
+        &fixture.profile,
+        "test-host",
+        id,
+        .{
+            .cwd = "/workspace",
+            .shell = .{ .executable = .{ .path = "/bin/zsh" } },
+        },
+        testPersistence("/workspace"),
+    );
+    defer session.deinitUnlaunched();
+
+    for ([_]contracts.AttentionState{
+        .{ .attention = .agent_wait, .write_lease = .agent },
+        .{ .attention = .user_takeover, .write_lease = .human },
+    }) |attention| {
+        session.durable.record.attention = attention;
+        var result = try session.engine.feedMode("\x1b[5n", .native_live);
+        defer result.deinit(alloc);
+        try std.testing.expectEqual(@as(usize, 1), result.replies.items.len);
+        try std.testing.expectEqualStrings("\x1b[0n", result.replies.items[0].bytes);
+    }
+}
+
+test "missing corrupt and unsupported checkpoints fall back only with full raw continuity" {
+    const alloc = std.testing.allocator;
+    var fixture = try TestDurableFixture.init(alloc);
+    defer fixture.deinit();
+    const id = try alloc.dupe(u8, "terminal-screen-fallback");
+    var session = try Session.init(
+        alloc,
+        .{ .context = null, .update_fn = ignoreWorkUpdate },
+        &fixture.profile,
+        "test-host",
+        id,
+        .{
+            .cwd = "/workspace",
+            .shell = .{ .executable = .{ .path = "/bin/zsh" } },
+            .dimensions = .{ .rows = 3, .columns = 10 },
+        },
+        testPersistence("/workspace"),
+    );
+    defer session.deinitUnlaunched();
+    session.appendOutput("fallback");
+
+    const original_recovery = session.durable.record.screen_recovery;
+    inline for (.{
+        contracts.ScreenUnavailableReason.missing,
+        .corrupt,
+        .unsupported_schema,
+    }) |reason| {
+        session.durable.record.screen_recovery = .{ .unavailable = reason };
+        var recovered = try reconstructEngine(alloc, &session.durable);
+        defer recovered.deinit();
+        try std.testing.expectEqual(@as(u21, 'f'), recovered.cellAt(1, 1).?.codepoint);
+        try std.testing.expectEqual(
+            contracts.ScreenRecovery{ .unavailable = reason },
+            session.durable.facts().screen_recovery,
+        );
+    }
+
+    session.durable.record.screen_recovery = .{ .unavailable = .corrupt };
+    session.durable.record.available_from.offset = 1;
+    session.durable.record.raw_gap = .{
+        .missing_from = .{ .segment = 1, .offset = 0 },
+        .available_from = .{ .segment = 1, .offset = 1 },
+    };
+    session.durable.record.journal_files[0].range.start.offset = 1;
+    session.durable.record.journal_files[0].payload_bytes -= 1;
+    session.durable.record.journal_payload_bytes -= 1;
+    try std.testing.expectError(
+        error.ScreenRawGap,
+        reconstructEngine(alloc, &session.durable),
+    );
+    session.durable.record.available_from.offset = 0;
+    session.durable.record.raw_gap = null;
+    session.durable.record.journal_files[0].range.start.offset = 0;
+    session.durable.record.journal_files[0].payload_bytes += 1;
+    session.durable.record.journal_payload_bytes += 1;
+    session.durable.record.screen_recovery = original_recovery;
+}
+
+test "recovery classifiers preserve allocation and transient failures" {
+    try std.testing.expectEqual(
+        contracts.ScreenUnavailableReason.unsupported_schema,
+        engine_checkpoint_unavailable_reason(error.UnsupportedEngineRevision).?,
+    );
+    try std.testing.expectEqual(
+        contracts.ScreenUnavailableReason.corrupt,
+        engine_checkpoint_unavailable_reason(error.InvalidEngineCheckpoint).?,
+    );
+    try std.testing.expect(
+        engine_checkpoint_unavailable_reason(error.OutOfMemory) == null,
+    );
+    try std.testing.expect(replay_feed_error_is_corrupt(
+        error.TooManyCsiParameters,
+    ));
+    try std.testing.expect(!replay_feed_error_is_corrupt(error.OutOfMemory));
+}
+
+test "checkpoint load allocation failure preserves durable recovery facts" {
+    const alloc = std.testing.allocator;
+    var fixture = try TestDurableFixture.init(alloc);
+    defer fixture.deinit();
+    const id = try alloc.dupe(u8, "terminal-checkpoint-load-oom");
+    var session = try Session.init(
+        alloc,
+        .{ .context = null, .update_fn = ignoreWorkUpdate },
+        &fixture.profile,
+        "test-host",
+        id,
+        .{
+            .cwd = "/workspace",
+            .shell = .{ .executable = .{ .path = "/bin/zsh" } },
+        },
+        testPersistence("/workspace"),
+    );
+    defer session.deinitUnlaunched();
+
+    session.appendOutput("checkpoint");
+    try session.checkpointLocked(
+        session.durable.output_cursor(),
+        io_mod.milliTimestamp(),
+    );
+    const recovery = session.durable.record.screen_recovery;
+    const generation = session.durable.record.checkpoint_generation;
+    const checkpoint_bytes = session.durable.record.checkpoint_payload_bytes;
+    const cleanup_generation = session.durable.record.checkpoint_cleanup_generation;
+
+    var failing = std.testing.FailingAllocator.init(
+        alloc,
+        .{ .fail_index = 0 },
+    );
+    try std.testing.expectError(
+        error.OutOfMemory,
+        reconstructEngine(failing.allocator(), &session.durable),
+    );
+    try std.testing.expect(failing.has_induced_failure);
+    try std.testing.expectEqual(recovery, session.durable.record.screen_recovery);
+    try std.testing.expectEqual(generation, session.durable.record.checkpoint_generation);
+    try std.testing.expectEqual(
+        checkpoint_bytes,
+        session.durable.record.checkpoint_payload_bytes,
+    );
+    try std.testing.expectEqual(
+        cleanup_generation,
+        session.durable.record.checkpoint_cleanup_generation,
+    );
+
+    var retained = (try session.durable.load_checkpoint(alloc)).?;
+    defer retained.deinit(alloc);
+    try std.testing.expectEqual(generation, session.durable.record.checkpoint_generation);
+}
+
+test "journal engine feed allocation failure preserves durable recovery facts" {
+    const alloc = std.testing.allocator;
+    var fixture = try TestDurableFixture.init(alloc);
+    defer fixture.deinit();
+    const id = try alloc.dupe(u8, "terminal-replay-feed-oom");
+    var session = try Session.init(
+        alloc,
+        .{ .context = null, .update_fn = ignoreWorkUpdate },
+        &fixture.profile,
+        "test-host",
+        id,
+        .{
+            .cwd = "/workspace",
+            .shell = .{ .executable = .{ .path = "/bin/zsh" } },
+        },
+        testPersistence("/workspace"),
+    );
+    defer session.deinitUnlaunched();
+
+    session.appendOutput("base");
+    try session.checkpointLocked(
+        session.durable.output_cursor(),
+        io_mod.milliTimestamp(),
+    );
+    try session.durable.append(
+        "\x1b]8;;https://example.com\x1b\\X\x1b]8;;\x1b\\",
+        io_mod.milliTimestamp(),
+    );
+    const recovery = session.durable.record.screen_recovery;
+    const generation = session.durable.record.checkpoint_generation;
+    const checkpoint_bytes = session.durable.record.checkpoint_payload_bytes;
+    const cleanup_generation = session.durable.record.checkpoint_cleanup_generation;
+
+    var probe = std.testing.FailingAllocator.init(alloc, .{});
+    var recovered = try reconstructEngine(probe.allocator(), &session.durable);
+    recovered.deinit();
+    try std.testing.expect(probe.alloc_index > 0);
+    try std.testing.expectEqual(probe.allocated_bytes, probe.freed_bytes);
+
+    var failing = std.testing.FailingAllocator.init(
+        alloc,
+        .{ .fail_index = probe.alloc_index - 1 },
+    );
+    try std.testing.expectError(
+        error.OutOfMemory,
+        reconstructEngine(failing.allocator(), &session.durable),
+    );
+    try std.testing.expect(failing.has_induced_failure);
+    try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+    try std.testing.expectEqual(recovery, session.durable.record.screen_recovery);
+    try std.testing.expectEqual(generation, session.durable.record.checkpoint_generation);
+    try std.testing.expectEqual(
+        checkpoint_bytes,
+        session.durable.record.checkpoint_payload_bytes,
+    );
+    try std.testing.expectEqual(
+        cleanup_generation,
+        session.durable.record.checkpoint_cleanup_generation,
+    );
+}
+
+test "malformed raw fallback durably replaces an invalid checkpoint with corrupt" {
+    const alloc = std.testing.allocator;
+    var fixture = try TestDurableFixture.init(alloc);
+    defer fixture.deinit();
+    const id = try alloc.dupe(u8, "terminal-malformed-raw-recovery");
+    var session = try Session.init(
+        alloc,
+        .{ .context = null, .update_fn = ignoreWorkUpdate },
+        &fixture.profile,
+        "test-host",
+        id,
+        .{
+            .cwd = "/workspace",
+            .shell = .{ .executable = .{ .path = "/bin/zsh" } },
+        },
+        testPersistence("/workspace"),
+    );
+    var session_owned = true;
+    defer if (session_owned) session.deinitUnlaunched();
+
+    const malformed = "\x1b[1;1;1;1;1;1;1;1;1;1;1;1;1;1;1;1;1H";
+    try session.durable.append(malformed, io_mod.milliTimestamp());
+    const invalid_payload = "invalid-engine-checkpoint";
+    try session.durable.store_checkpoint(.{
+        .engine_schema_revision = terminal_engine.checkpoint_schema_revision,
+        .applied_cursor = session.durable.output_cursor(),
+        .payload_len = invalid_payload.len,
+        .checksum = contracts.checkpoint_checksum(invalid_payload),
+    }, invalid_payload, io_mod.milliTimestamp());
+
+    try std.testing.expectError(
+        error.ScreenCorrupt,
+        reconstructEngine(alloc, &session.durable),
+    );
+    try std.testing.expectEqual(
+        contracts.ScreenRecovery{ .unavailable = .corrupt },
+        session.durable.facts().screen_recovery,
+    );
+    try std.testing.expectEqual(
+        @as(u64, 0),
+        session.durable.record.checkpoint_generation,
+    );
+    try std.testing.expectEqual(
+        @as(u64, 0),
+        session.durable.record.checkpoint_payload_bytes,
+    );
+    try std.testing.expect(
+        session.durable.record.checkpoint_cleanup_generation == null,
+    );
+
+    session.deinitUnlaunched();
+    session_owned = false;
+    const reopened = try fixture.profile.open_terminal(
+        "terminal-malformed-raw-recovery",
+    );
+    defer fixture.profile.release_terminal(reopened);
+    try std.testing.expectEqual(
+        contracts.ScreenRecovery{ .unavailable = .corrupt },
+        reopened.facts().screen_recovery,
+    );
+}
+
+test "shutdownSessionsOnly signals live sessions and leaves them allocated" {
+    if (!isSupported()) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var fixture = try TestDurableFixture.init(alloc);
+    defer fixture.deinit();
+    const id = try alloc.dupe(u8, "terminal-shutdown-only");
+    var probe: WorkProbe = .{};
+    var session = try Session.init(
+        alloc,
+        .{ .context = &probe, .update_fn = WorkProbe.update },
+        &fixture.profile,
+        "test-host",
+        id,
+        .{
+            .cwd = "/workspace",
+            .shell = .{ .executable = .{ .path = "/bin/zsh" } },
+        },
+        testPersistence("/workspace"),
+    );
+    defer session.deinitUnlaunched();
+
+    session.markLive();
+    session.lifecycle = .running;
+    // A real handle, so releasing it is observable rather than vacuous.
+    session.liveness_file = try std.Io.Dir.createFileAbsolute(
+        io_mod.getIo(),
+        "/dev/null",
+        .{ .truncate = false },
+    );
+
+    var registry = SupportedRegistry{
+        .alloc = alloc,
+        .tracker = .{ .context = &probe, .update_fn = WorkProbe.update },
+        .profile = &fixture.profile,
+        .host_identity = "test-host",
+        .durable_root = "/workspace",
+        .transport_root = "/workspace",
+    };
+    registry.sessions[0] = &session;
+
+    // A slot with no outstanding reference is exactly the slot a client may
+    // recycle, so this is the case the pin has to cover.
+    try std.testing.expectEqual(@as(usize, 0), registry.references[0]);
+
+    registry.shutdownSessionsOnly();
+
+    // Every reference taken to pin the session for shutdown is given back, so
+    // the drain cannot wedge a later removeOwned that waits for the count.
+    try std.testing.expectEqual(@as(usize, 0), registry.references[0]);
+
+    // The liveness handle is released, so the session was actually shut down.
+    try std.testing.expect(session.liveness_file == null);
+    // And the session is still allocated: the registry slot still points at it
+    // and the object is readable, which is what makes this safe to call while
+    // client threads still hold session pointers.
+    try std.testing.expect(registry.sessions[0] == &session);
+    try std.testing.expectEqual(contracts.Lifecycle.running, session.lifecycle);
+}
+
+test "durable release and exit wait survive resident session removal" {
+    if (!isSupported()) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var fixture = try TestDurableFixture.init(alloc);
+    defer fixture.deinit();
+    const persistence = testPersistence("/workspace");
+    const authority = contracts.AuthorityClaim{
+        .principal = persistence.grant.principal,
+        .actor = persistence.grant.actor,
+        .generation = persistence.grant.generation,
+        .proof = persistence.proof,
+    };
+    var durable = try terminal_store.DurableSession.create(&fixture.profile, .{
+        .session_id = "terminal-durable-fallback",
+        .host_identity = "test-host",
+        .shell = "/bin/zsh",
+        .cwd = "/workspace",
+        .command = null,
+        .backend = .native,
+        .dimensions = .{ .rows = 24, .columns = 80 },
+        .persistence = persistence,
+        .now_ms = 1,
+    });
+    var durable_owned = true;
+    defer if (durable_owned) durable.deinit();
+    try durable.persist_termination(.{ .exited = 17 }, 2);
+    _ = try durable.acquire_write_lease(authority, 3);
+    durable.deinit();
+    durable_owned = false;
+
+    var probe: WorkProbe = .{};
+    var registry = SupportedRegistry{
+        .alloc = alloc,
+        .tracker = .{ .context = &probe, .update_fn = WorkProbe.update },
+        .profile = &fixture.profile,
+        .host_identity = "test-host",
+        .durable_root = "/workspace",
+        .transport_root = "/workspace",
+    };
+    var cancelled = std.atomic.Value(bool).init(false);
+    var released = try registry.write(.{
+        .session_id = "terminal-durable-fallback",
+        .lease = .release,
+        .authority = authority,
+    }, &cancelled);
+    defer released.deinit(alloc);
+    switch (released.view()) {
+        .success => |success| switch (success) {
+            .write => |write| {
+                try std.testing.expectEqual(@as(u32, 0), write.accepted_bytes);
+                try std.testing.expectEqual(
+                    contracts.WriteLease.none,
+                    write.session.attention.write_lease,
+                );
+                try std.testing.expectEqual(
+                    contracts.Lifecycle.exited,
+                    write.session.lifecycle,
+                );
+            },
+            else => return error.TestUnexpectedResult,
+        },
+        .failure => return error.TestUnexpectedResult,
+    }
+
+    var waited = try registry.wait(.{
+        .session_id = "terminal-durable-fallback",
+        .return_when = .exit,
+        .safety_ceiling_ms = 1_000,
+        .authority = authority,
+    }, &cancelled);
+    defer waited.deinit(alloc);
+    switch (waited.view()) {
+        .success => |success| switch (success) {
+            .wait => |wait| try std.testing.expectEqual(
+                contracts.ReturnOutcome{ .exited = 17 },
+                wait.outcome,
+            ),
+            else => return error.TestUnexpectedResult,
+        },
+        .failure => return error.TestUnexpectedResult,
+    }
+}
+
+test "a referenced slot is never recycled out from under its holder" {
+    if (!isSupported()) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var fixture = try TestDurableFixture.init(alloc);
+    defer fixture.deinit();
+    const id = try alloc.dupe(u8, "terminal-recycle-guard");
+    var probe: WorkProbe = .{};
+    var resident = try Session.init(
+        alloc,
+        .{ .context = &probe, .update_fn = WorkProbe.update },
+        &fixture.profile,
+        "test-host",
+        id,
+        .{
+            .cwd = "/workspace",
+            .shell = .{ .executable = .{ .path = "/bin/zsh" } },
+        },
+        testPersistence("/workspace"),
+    );
+    defer resident.deinitUnlaunched();
+    resident.lifecycle = .exited;
+    try std.testing.expect(resident.isRecyclable());
+
+    const incoming_id = try alloc.dupe(u8, "terminal-recycle-incoming");
+    var incoming = try Session.init(
+        alloc,
+        .{ .context = &probe, .update_fn = WorkProbe.update },
+        &fixture.profile,
+        "test-host",
+        incoming_id,
+        .{
+            .cwd = "/workspace",
+            .shell = .{ .executable = .{ .path = "/bin/zsh" } },
+        },
+        testPersistence("/workspace"),
+    );
+    defer incoming.deinitUnlaunched();
+
+    var registry = SupportedRegistry{
+        .alloc = alloc,
+        .tracker = .{ .context = &probe, .update_fn = WorkProbe.update },
+        .profile = &fixture.profile,
+        .host_identity = "test-host",
+        .durable_root = "/workspace",
+        .transport_root = "/workspace",
+        .sessions = @splat(&resident),
+        .references = @splat(1),
+    };
+
+    // Every slot holds a recyclable session, so only the reference keeps them.
+    // This is what makes it safe to signal a session after releasing the lock.
+    try std.testing.expect(registry.reserve(&incoming) == null);
+
+    // Drop the references and the same slots become recyclable again, so the
+    // check above is about the reference and not about some other refusal.
+    registry.references = @splat(0);
+    const reservation = registry.reserve(&incoming) orelse
+        return error.TestExpectedRecycle;
+    try std.testing.expectEqual(@as(?*Session, &resident), reservation.evicted);
 }

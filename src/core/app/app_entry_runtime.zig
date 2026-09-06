@@ -270,7 +270,7 @@ fn runInteractiveWithDeps(comptime App: type, comptime cooperative: bool, alloc:
             error.SessionAuthorityBoundaryUnavailable,
             error.SessionCommitBoundaryUnavailable,
             => {
-                writeStderr(deps, "fx: this session is being updated; wait a moment and retry\n");
+                writeStderr(deps, "fx: a saved session has an unfinished update that could not be recovered; run `fx doctor` to identify the affected session\n");
                 return .{ .exit = 1 };
             },
             error.OneOffSessionNotResumable => {
@@ -1280,11 +1280,11 @@ test "app entry maps unavailable session state to one expected startup failure" 
         },
         .{
             .init_error = error.SessionAuthorityBoundaryUnavailable,
-            .message = "fx: this session is being updated; wait a moment and retry\n",
+            .message = "fx: a saved session has an unfinished update that could not be recovered; run `fx doctor` to identify the affected session\n",
         },
         .{
             .init_error = error.SessionCommitBoundaryUnavailable,
-            .message = "fx: this session is being updated; wait a moment and retry\n",
+            .message = "fx: a saved session has an unfinished update that could not be recovered; run `fx doctor` to identify the affected session\n",
         },
         .{
             .init_error = error.OneOffSessionNotResumable,

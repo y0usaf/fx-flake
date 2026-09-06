@@ -740,6 +740,7 @@ fn grepFilesFailureWithOps(
 
     const result = try callWithOps(.{ .allocator = alloc, .workspace_root = workspace_root }, .{ .ptr = &input, .deinit_fn = noopInputDeinit }, ops);
     switch (result) {
+        .rich => return error.TestUnexpectedRichResult,
         .failure => |body| return body,
         .success => |body| {
             defer alloc.free(body);

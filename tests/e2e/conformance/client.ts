@@ -34,6 +34,10 @@ if (requestedProtocol && !supportedProtocols.has(requestedProtocol)) {
   console.error(`unsupported conformance protocol: ${requestedProtocol}`);
   process.exit(2);
 }
+const conformanceEnv = {
+  ...process.env,
+  FX_MCP_PROTOCOL_VERSION: requestedProtocol ?? "2026-07-28",
+};
 let configuredServerUrl = serverUrl;
 let legacyProbeProxy: LegacyProbeProxy | null = null;
 if (requestedProtocol && requestedProtocol !== "2026-07-28") {
@@ -61,7 +65,7 @@ if (scenario === "sep-2322-client-request-state") {
     ],
     {
       cwd: repoRoot,
-      env: process.env,
+      env: conformanceEnv,
       stdout: "pipe",
       stderr: "pipe",
     },
@@ -82,7 +86,7 @@ for (const call of toolCalls) {
   permission[`mcp_conformance_${call.name}`] = "allow";
 }
 
-const fxBin = resolve(import.meta.dirname, "../../../zig-out/bin/fx");
+const fxBin = resolve(import.meta.dirname, "../../../zig-out/bin/omfx");
 const root = mkdtempSync(join(tmpdir(), "fx-mcp-conformance-client-"));
 const home = join(root, "home");
 const workspace = join(root, "workspace");
@@ -151,7 +155,7 @@ try {
     {
       cwd: workspace,
       env: {
-        ...process.env,
+        ...conformanceEnv,
         HOME: home,
         AI_GATEWAY_API_KEY: "mcp-conformance-placeholder",
         VERCEL_OIDC_TOKEN: "",

@@ -2816,6 +2816,145 @@ fn check_owned_action_request_allocation_failures(alloc: Allocator) !void {
     try request.value.validate();
 }
 
+test "owned action request cleans every allocation failure" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        check_owned_action_request_allocation_failures,
+        .{},
+    );
+}
+
+test "terminal lifecycle accepts every valid transition and rejects the rest" {
+    const valid = [_]struct {
+        from: Lifecycle,
+        event: LifecycleEvent,
+        to: Lifecycle,
+    }{
+        .{ .from = .starting, .event = .child_started, .to = .running },
+        .{ .from = .starting, .event = .child_exited, .to = .exited },
+        .{ .from = .starting, .event = .host_lost, .to = .lost },
+        .{ .from = .starting, .event = .close, .to = .closed },
+        .{ .from = .running, .event = .child_exited, .to = .exited },
+        .{ .from = .running, .event = .host_lost, .to = .lost },
+        .{ .from = .running, .event = .close, .to = .closed },
+        .{ .from = .exited, .event = .close, .to = .closed },
+        .{ .from = .lost, .event = .close, .to = .closed },
+    };
+    const states = [_]Lifecycle{ .starting, .running, .exited, .lost, .closed };
+    const events = [_]LifecycleEvent{ .child_started, .child_exited, .host_lost, .close };
+
+    for (states) |state| {
+        for (events) |event| {
+            var expected: ?Lifecycle = null;
+            for (valid) |case| {
+                if (case.from == state and case.event == event) {
+                    expected = case.to;
+                    break;
+                }
+            }
+            if (expected) |next| {
+                try std.testing.expectEqual(next, try transition_lifecycle(state, event));
+            } else {
+                try std.testing.expectError(
+                    error.InvalidLifecycleTransition,
+                    transition_lifecycle(state, event),
+                );
+            }
+        }
+    }
+}
+
+test "attention cancellation releases only the caller claim" {
+    const user_state = AttentionState{
+        .attention = .user_takeover,
+        .write_lease = .human,
+    };
+    try user_state.validate();
+    try std.testing.expectEqual(
+        AttentionState{ .attention = .background, .write_lease = .none },
+        cancel_attention(user_state, .human),
+    );
+    try std.testing.expectEqual(user_state, cancel_attention(user_state, .agent));
+
+    const agent_state = AttentionState{
+        .attention = .agent_wait,
+        .write_lease = .agent,
+    };
+    try agent_state.validate();
+    try std.testing.expectEqual(
+        AttentionState{ .attention = .background, .write_lease = .none },
+        cancel_attention(agent_state, .agent),
+    );
+    try std.testing.expectError(
+        error.InvalidAttentionState,
+        (AttentionState{
+            .attention = .user_takeover,
+            .write_lease = .agent,
+        }).validate(),
+    );
+}
+
+test "raw cursor ranges and gaps preserve monotonic segments" {
+    try (RawRange{
+        .start = .{ .segment = 1, .offset = 4 },
+        .end = .{ .segment = 1, .offset = 9 },
+    }).validate();
+    try std.testing.expectError(
+        error.InvalidRawRange,
+        (RawRange{
+            .start = .{ .segment = 1, .offset = 9 },
+            .end = .{ .segment = 1, .offset = 4 },
+        }).validate(),
+    );
+    try std.testing.expectError(
+        error.InvalidRawRange,
+        (RawRange{
+            .start = .{ .segment = 1, .offset = 4 },
+            .end = .{ .segment = 2, .offset = 4 },
+        }).validate(),
+    );
+    try (RawGap{
+        .missing_from = .{ .segment = 1, .offset = 10 },
+        .available_from = .{ .segment = 2, .offset = 0 },
+    }).validate();
+    try std.testing.expectError(
+        error.InvalidRawGap,
+        (RawGap{
+            .missing_from = .{ .segment = 2, .offset = 0 },
+            .available_from = .{ .segment = 1, .offset = 10 },
+        }).validate(),
+    );
+    try std.testing.expectError(
+        error.InvalidRawCursor,
+        (RawCursor{ .segment = 0, .offset = 0 }).validate(),
+    );
+}
+
+test "return conditions schedules and identifiers reject invalid boundaries" {
+    try (ReturnCondition{ .quiet = 1 }).validate();
+    try (ReturnCondition{ .match = "ready" }).validate();
+    try std.testing.expectError(
+        error.InvalidReturnCondition,
+        (ReturnCondition{ .quiet = 0 }).validate(),
+    );
+    try std.testing.expectError(
+        error.InvalidReturnCondition,
+        (ReturnCondition{ .match = "" }).validate(),
+    );
+
+    try (PollSchedule{ .interval_ms = 1 }).validate();
+    try std.testing.expectError(
+        error.InvalidSchedule,
+        (PollSchedule{ .interval_ms = 0 }).validate(),
+    );
+
+    try validate_session_id("terminal-1");
+    try std.testing.expectError(
+        error.InvalidSessionId,
+        validate_session_id("../terminal-1"),
+    );
+}
+
 fn test_render_cells() [4]RenderCell {
     return .{
         .{
@@ -2836,6 +2975,73 @@ fn test_render_cells() [4]RenderCell {
     };
 }
 
+test "render snapshots validate exact cell grids cursor and checked bounds" {
+    const cells = test_render_cells();
+    const snapshot = RenderSnapshot{
+        .dimensions = .{ .rows = 2, .columns = 2 },
+        .cursor = .{
+            .row = 1,
+            .column = 1,
+            .shape = .bar,
+            .blinking = false,
+        },
+        .modes = .{
+            .alternate_screen = true,
+            .bracketed_paste = true,
+        },
+        .cells = &cells,
+    };
+    try snapshot.validate();
+    try std.testing.expect(max_render_snapshot_bytes <= max_checkpoint_payload_bytes);
+
+    try std.testing.expectError(
+        error.InvalidDimensions,
+        (RenderSnapshot{
+            .dimensions = .{ .rows = 0, .columns = 80 },
+            .cursor = .{ .row = 0, .column = 0 },
+            .cells = &.{},
+        }).validate(),
+    );
+    try std.testing.expectError(
+        error.InvalidRenderSnapshot,
+        (RenderSnapshot{
+            .dimensions = .{ .rows = 2, .columns = 2 },
+            .cursor = .{ .row = 2, .column = 0 },
+            .cells = &cells,
+        }).validate(),
+    );
+    try std.testing.expectError(
+        error.InvalidRenderSnapshot,
+        (RenderSnapshot{
+            .dimensions = .{ .rows = 2, .columns = 3 },
+            .cursor = .{ .row = 0, .column = 0 },
+            .cells = &cells,
+        }).validate(),
+    );
+    try std.testing.expectError(
+        error.RenderSnapshotTooLarge,
+        (RenderSnapshot{
+            .dimensions = .{
+                .rows = max_dimension,
+                .columns = max_dimension,
+            },
+            .cursor = .{ .row = 0, .column = 0 },
+            .cells = &.{},
+        }).validate(),
+    );
+
+    var invalid_wide = cells;
+    invalid_wide[2].kind = .blank;
+    try std.testing.expectError(
+        error.InvalidRenderCell,
+        (RenderSnapshot{
+            .dimensions = .{ .rows = 2, .columns = 2 },
+            .cursor = .{ .row = 0, .column = 0 },
+            .cells = &invalid_wide,
+        }).validate(),
+    );
+}
+
 fn check_owned_render_snapshot_allocation_failures(alloc: Allocator) !void {
     const cells = test_render_cells();
     var snapshot = try OwnedRenderSnapshot.init(alloc, .{
@@ -2845,6 +3051,81 @@ fn check_owned_render_snapshot_allocation_failures(alloc: Allocator) !void {
     });
     defer snapshot.deinit(alloc);
     try snapshot.view().validate();
+}
+
+test "owned render snapshots clean every allocation failure" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        check_owned_render_snapshot_allocation_failures,
+        .{},
+    );
+}
+
+test "checkpoint envelopes bind payload size checksum and cursor anchor" {
+    const payload = "opaque checkpoint";
+    const valid = CheckpointEnvelope{
+        .engine_schema_revision = 1,
+        .applied_cursor = .{ .segment = 2, .offset = 41 },
+        .payload_len = payload.len,
+        .checksum = checkpoint_checksum(payload),
+    };
+    try valid.validate(payload);
+    try validate_checkpoint_anchor(
+        valid,
+        .{ .segment = 2, .offset = 42 },
+    );
+
+    var corrupt = valid;
+    corrupt.checksum[0] ^= 1;
+    try std.testing.expectError(
+        error.CheckpointChecksumMismatch,
+        corrupt.validate(payload),
+    );
+    try std.testing.expectError(
+        error.InvalidCheckpoint,
+        valid.validate("short"),
+    );
+
+    var unsupported_anchor = valid;
+    unsupported_anchor.applied_cursor.segment = 0;
+    try std.testing.expectError(
+        error.InvalidCheckpoint,
+        unsupported_anchor.validate(payload),
+    );
+    try std.testing.expectError(
+        error.InvalidCheckpoint,
+        validate_checkpoint_anchor(
+            valid,
+            .{ .segment = 3, .offset = 42 },
+        ),
+    );
+    try std.testing.expectError(
+        error.InvalidCheckpoint,
+        validate_checkpoint_anchor(
+            valid,
+            .{ .segment = 2, .offset = 40 },
+        ),
+    );
+
+    var oversized = valid;
+    oversized.payload_len = max_checkpoint_payload_bytes + 1;
+    try std.testing.expectError(
+        error.CheckpointTooLarge,
+        oversized.validate(payload),
+    );
+
+    const reasons = [_]ScreenUnavailableReason{
+        .missing,
+        .corrupt,
+        .unsupported_schema,
+        .retention_evicted,
+        .raw_gap,
+        .resize_uncheckpointed,
+    };
+    for (reasons) |reason| {
+        const state = ScreenRecovery{ .unavailable = reason };
+        try std.testing.expectEqual(reason, state.unavailable);
+    }
 }
 
 fn test_session_facts() SessionFacts {
@@ -3031,6 +3312,7 @@ test "action-specific result validation rejects incoherent values" {
         } }).validate(),
     );
 }
+
 fn check_owned_result_allocation_failures(alloc: Allocator) !void {
     const cells = test_render_cells();
     var result = try OwnedResult.init(alloc, .{ .success = .{ .screen = .{

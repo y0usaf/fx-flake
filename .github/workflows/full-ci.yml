@@ -65,11 +65,11 @@ jobs:
           status_stderr="$(mktemp)"
           trap 'rm -f "$help_stdout" "$help_stderr" "$status_stdout" "$status_stderr"' EXIT
 
-          ./zig-out/bin/fx help >"$help_stdout" 2>"$help_stderr"
+          ./zig-out/bin/omfx help >"$help_stdout" 2>"$help_stderr"
           test -s "$help_stdout"
           test ! -s "$help_stderr"
 
-          ./zig-out/bin/fx status --json >"$status_stdout" 2>"$status_stderr"
+          ./zig-out/bin/omfx status --json >"$status_stdout" 2>"$status_stderr"
           test -s "$status_stdout"
           test ! -s "$status_stderr"
 

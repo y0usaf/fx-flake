@@ -1,12 +1,8 @@
 const std = @import("std");
-const agent_runtime = @import("../agent/agent_runtime.zig");
 const managed_execution = @import("../execution/managed_execution.zig");
 const permission_request = @import("../permissions/permission_request.zig");
 const permission_prompter = @import("../permissions/permission_prompter.zig");
-const runtime_assistant_stream = @import("../agent/runtime/assistant_stream.zig");
-const runtime_config = @import("../agent/runtime/config.zig");
 const runtime_deps = @import("../agent/runtime/deps.zig");
-const runtime_lifecycle = @import("../agent/runtime/lifecycle.zig");
 const worker_runtime = @import("../agent/worker_runtime.zig");
 const authority_mod = @import("authority.zig");
 const approval_registry_mod = @import("approval_registry.zig");
@@ -23,6 +19,135 @@ const tool_dispatch = @import("../tooling/tool_dispatch.zig");
 const types = @import("../shared/types.zig");
 
 const Allocator = std.mem.Allocator;
+
+test "child compaction preserves work identity and permits final commit" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(root);
+    var store = try session_store.Store.initFromHome(alloc, root, root);
+    defer store.deinit(alloc);
+    const state = session_codec.DurableSessionState{
+        .id = @constCast("child-compaction"),
+        .origin_workspace_root = @constCast(root),
+        .workspace_root = @constCast(root),
+        .created_at_ms = 1,
+        .updated_at_ms = 1,
+        .conversation_language = session.ConversationLanguage.literal("en"),
+        .history = &.{},
+        .total_input_tokens = 0,
+        .total_output_tokens = 0,
+        .preferences = .{ .model = @constCast("test"), .effort = .auto, .fast_mode = false },
+    };
+    var writable = try store.startWritableSession(alloc, state);
+    defer writable.deinit(alloc);
+    var turn = try TurnContext.init(alloc, &writable, 0);
+    defer turn.deinit();
+    turn.active_work_id = "work-checkpoint";
+    try turn.commitContextCompaction(.{
+        .summary = @constCast("<context_handoff>continue child work</context_handoff>"),
+        .removed_turn_count = 0,
+        .compaction_count = 1,
+    }, .{ .user = .{ .text = @constCast("child request") }, .assistant = @constCast("") }, null, 2);
+    try std.testing.expect(!turn.committed);
+    try turn.setRecoveryCheckpoint(.{
+        .turn_id = 7,
+        .user = .{ .text = @constCast("child request") },
+        .assistant_source = @constCast("partial"),
+        .cause = .network_interrupted,
+        .action = .paused,
+        .authority = .{ .provider = .gateway, .model = @constCast("test") },
+        .requested_fast_mode = false,
+        .fast_mode = false,
+        .max_provider_attempts = 3,
+        .consumed_provider_attempts = 1,
+    }, 2);
+    try std.testing.expectEqualStrings("work-checkpoint", writable.state.recovery_checkpoint.?.user.work_id.?);
+    try turn.commit("work-checkpoint", .{ .assistant = .{
+        .user = .{ .text = @constCast("child request") },
+        .assistant = @constCast("child done"),
+    } }, 10, 5, 3);
+    try std.testing.expect(turn.committed);
+    const bytes = try writable.conversation_writer.readAllForTest(alloc);
+    defer alloc.free(bytes);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, bytes, "child request"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, bytes, "work-checkpoint"));
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "child done") != null);
+}
+
+test "child recovery admission distinguishes work identity from repeated prompt text" {
+    const alloc = std.testing.allocator;
+    for ([_][]const u8{ "old-work", "new-work" }) |work_id| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+        defer alloc.free(root);
+        var store = try session_store.Store.initFromHome(alloc, root, root);
+        defer store.deinit(alloc);
+        const session_id = "child-recovery-admission";
+        const user = types.UserTurn{ .text = @constCast("same prompt"), .work_id = @constCast("old-work") };
+        {
+            var writable = try store.startWritableSession(alloc, .{
+                .id = @constCast(session_id),
+                .origin_workspace_root = @constCast(root),
+                .workspace_root = @constCast(root),
+                .created_at_ms = 1,
+                .updated_at_ms = 1,
+                .conversation_language = session.ConversationLanguage.literal("en"),
+                .history = &.{},
+                .total_input_tokens = 0,
+                .total_output_tokens = 0,
+                .preferences = .{ .model = @constCast("test"), .effort = .auto, .fast_mode = false },
+            });
+            defer writable.deinit(alloc);
+            _ = try writable.commitContextCompaction(alloc, .{
+                .summary = @constCast("<context_handoff>old work checkpoint</context_handoff>"),
+                .removed_turn_count = 0,
+                .compaction_count = 1,
+            }, .{ .user = user, .assistant = @constCast("") }, null, 2);
+            _ = try writable.appendEvent(alloc, .{ .recovery_checkpoint_set = .{ .checkpoint = .{
+                .turn_id = 7,
+                .user = user,
+                .assistant_source = @constCast("old partial answer"),
+                .cause = .network_interrupted,
+                .action = .paused,
+                .authority = .{ .provider = .gateway, .model = @constCast("test") },
+                .requested_fast_mode = false,
+                .fast_mode = false,
+                .max_provider_attempts = 3,
+                .consumed_provider_attempts = 1,
+            } } }, 3);
+        }
+        const same_work = std.mem.eql(u8, work_id, "old-work");
+        {
+            var writable = try store.resumeForWrite(alloc, session_id);
+            defer writable.deinit(alloc);
+            var turn = try TurnContext.init(alloc, &writable, 0);
+            defer turn.deinit();
+            turn.active_work_id = work_id;
+            var recovery = try turn.prepareRecoveryForActiveWork(alloc);
+            defer if (recovery) |*checkpoint| checkpoint.deinit(alloc);
+            try std.testing.expectEqual(same_work, recovery != null);
+            try std.testing.expect(!turn.committed);
+            try std.testing.expectEqual(same_work, writable.conversation_writer.turn_open);
+            try turn.commit(work_id, .{ .assistant = .{
+                .user = .{ .text = @constCast("same prompt") },
+                .assistant = @constCast("new answer"),
+            } }, 0, 0, 4);
+            try std.testing.expect(turn.committed);
+        }
+        var restored = try store.loadReadOnly(alloc, session_id);
+        defer restored.deinit(alloc);
+        try std.testing.expectEqual(@as(usize, if (same_work) 2 else 3), restored.history.len);
+        if (!same_work) {
+            try std.testing.expectEqualStrings("old-work", restored.history[1].interrupted.user.work_id.?);
+            try std.testing.expectEqualStrings("old partial answer", restored.history[1].interrupted.assistant.?);
+        }
+        try std.testing.expectEqualStrings(work_id, restored.history[restored.history.len - 1].assistant.user.work_id.?);
+        try std.testing.expectEqualStrings(work_id, restored.last_subagent_work_id.?);
+    }
+}
 
 pub const TurnPreferences = struct {
     provider: @import("../config/model_provider.zig").ProviderId = .gateway,
@@ -105,7 +230,7 @@ pub const TurnContext = struct {
         []const u8,
         child_state.Phase,
     ) anyerror!void = null,
-    failure_diagnostic: ?[]u8 = null,
+    failure_diagnostic: ?types.ModelFailureDiagnostic = null,
     committed: bool = false,
 
     pub fn init(
@@ -119,9 +244,9 @@ pub const TurnContext = struct {
             alloc,
             loaded.state.conversation_language,
             loaded.state.history,
-            loaded.state.context_history_start,
             loaded.state.permission_state,
         );
+        loaded.releaseHydrationHistory(alloc);
         return .{
             .alloc = alloc,
             .runtime = runtime,
@@ -131,7 +256,6 @@ pub const TurnContext = struct {
     }
 
     pub fn deinit(self: *TurnContext) void {
-        if (self.failure_diagnostic) |diagnostic| self.alloc.free(diagnostic);
         self.managed_executions.deinit();
         self.worker.deinit(self.alloc);
         self.runtime.deinit(self.alloc);
@@ -142,25 +266,12 @@ pub const TurnContext = struct {
         self: *TurnContext,
         code: []const u8,
         detail: []const u8,
-    ) Allocator.Error!void {
+    ) void {
         if (self.failure_diagnostic != null) return;
-        const safe_detail = if (text_utils.isModelSafeText(detail))
-            text_utils.utf8PrefixByBytes(
-                detail,
-                domain.max_cancellation_reason_bytes -| code.len -| 2,
-            )
-        else
-            "";
-        self.failure_diagnostic = if (safe_detail.len == 0)
-            try self.alloc.dupe(u8, text_utils.utf8PrefixByBytes(
-                code,
-                domain.max_cancellation_reason_bytes,
-            ))
-        else
-            try std.fmt.allocPrint(self.alloc, "{s}: {s}", .{ code, safe_detail });
+        self.failure_diagnostic = failureDiagnosticValue(code, detail);
     }
 
-    pub fn failureDiagnostic(self: *const TurnContext) ?[]const u8 {
+    pub fn failureDiagnostic(self: *const TurnContext) ?types.ModelFailureDiagnostic {
         return self.failure_diagnostic;
     }
 
@@ -168,11 +279,25 @@ pub const TurnContext = struct {
         return &self.runtime;
     }
 
-    pub fn snapshotRecoveryCheckpoint(
-        self: *const TurnContext,
+    pub fn prepareRecoveryForActiveWork(
+        self: *TurnContext,
         alloc: Allocator,
-    ) Allocator.Error!?session_codec.RecoveryCheckpoint {
+    ) CommitError!?session_codec.RecoveryCheckpoint {
         const checkpoint = self.loaded.state.recovery_checkpoint orelse return null;
+        if (self.loaded.conversation_writer.turn_open) {
+            const prior_work_id = checkpoint.user.work_id orelse return error.InvalidWorkId;
+            const work_id = self.active_work_id orelse return error.InvalidWorkId;
+            if (!std.mem.eql(u8, prior_work_id, work_id)) {
+                try self.appendCommittedHistory(
+                    prior_work_id,
+                    checkpoint.interruptedTurn(),
+                    self.loaded.state.total_input_tokens,
+                    self.loaded.state.total_output_tokens,
+                    io_mod.milliTimestamp(),
+                );
+                return null;
+            }
+        }
         return try checkpoint.dupe(alloc);
     }
 
@@ -388,6 +513,18 @@ pub const TurnContext = struct {
         timestamp_ms: i64,
     ) CommitError!void {
         if (self.committed) return error.TurnAlreadyCommitted;
+        try self.appendCommittedHistory(work_id, turn, total_input_tokens, total_output_tokens, timestamp_ms);
+        self.committed = true;
+    }
+
+    fn appendCommittedHistory(
+        self: *TurnContext,
+        work_id: []const u8,
+        turn: types.HistoryTurn,
+        total_input_tokens: u64,
+        total_output_tokens: u64,
+        timestamp_ms: i64,
+    ) CommitError!void {
         var committed_turn = session.dupeHistoryTurn(self.alloc, turn) catch
             return error.OutOfMemory;
         defer session.freeHistoryTurn(self.alloc, committed_turn);
@@ -397,8 +534,16 @@ pub const TurnContext = struct {
                 error.InvalidWorkId, error.ConflictingWorkId => error.InvalidWorkId,
             };
         };
-        self.runtime.appendHistoryEntry(self.alloc, committed_turn) catch
+        var prepared = self.runtime.prepareHistoryEntry(self.alloc, committed_turn) catch
             return error.OutOfMemory;
+        var prepared_owned = true;
+        defer if (prepared_owned) session.freeHistoryTurn(self.alloc, prepared);
+        self.loaded.prepareHistoryTurnForCommit(self.alloc, &prepared) catch |err| {
+            return switch (err) {
+                error.OutOfMemory => error.OutOfMemory,
+                else => error.SessionCommitFailed,
+            };
+        };
         _ = self.loaded.appendEvent(
             self.alloc,
             .{ .history_turn_committed = .{
@@ -406,16 +551,42 @@ pub const TurnContext = struct {
                 .total_input_tokens = total_input_tokens,
                 .total_output_tokens = total_output_tokens,
                 .work_id = @constCast(work_id),
-                .turn = committed_turn,
+                .turn = prepared,
             } },
             timestamp_ms,
-            .retry_expected_tail,
-            .{},
         ) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             else => return error.SessionCommitFailed,
         };
-        self.committed = true;
+        self.runtime.commitPreparedHistoryEntry(self.alloc, prepared);
+        prepared_owned = false;
+    }
+
+    pub fn commitContextCompaction(
+        self: *TurnContext,
+        summary: types.CompactedSummaryHistoryTurn,
+        active_prefix: ?types.AssistantHistoryTurn,
+        retained_from: ?types.ContextHistoryCut,
+        timestamp_ms: i64,
+    ) !void {
+        var prefix: ?types.HistoryTurn = if (active_prefix) |value|
+            try session.dupeHistoryTurn(self.alloc, .{ .assistant = value })
+        else
+            null;
+        defer if (prefix) |value| session.freeHistoryTurn(self.alloc, value);
+        if (prefix) |*value| {
+            try session.copyWorkIdToTurn(self.alloc, value, self.active_work_id orelse return error.InvalidWorkId);
+        }
+        const prepared = try session.prepareCompactedHistory(self.alloc, self.runtime.agent.history.items, summary, retained_from orelse .{ .turns = session.rawHistoryTurnCount(self.runtime.agent.history.items) });
+        errdefer types.freeHistoryTurnSlice(self.alloc, prepared);
+        _ = try self.loaded.commitContextCompaction(
+            self.alloc,
+            summary,
+            if (prefix) |value| value.assistant else null,
+            retained_from,
+            timestamp_ms,
+        );
+        self.runtime.commitCompactedHistory(self.alloc, prepared);
     }
 
     pub fn setRecoveryCheckpoint(
@@ -423,12 +594,17 @@ pub const TurnContext = struct {
         checkpoint: session_codec.RecoveryCheckpoint,
         timestamp_ms: i64,
     ) CommitError!void {
+        const work_id = self.active_work_id orelse return error.InvalidWorkId;
+        session.validateWorkId(work_id) catch return error.InvalidWorkId;
+        if (checkpoint.user.work_id) |checkpoint_work_id| {
+            if (!std.mem.eql(u8, checkpoint_work_id, work_id)) return error.InvalidWorkId;
+        }
+        var bound = checkpoint;
+        bound.user.work_id = @constCast(work_id);
         _ = self.loaded.appendEvent(
             self.alloc,
-            .{ .recovery_checkpoint_set = .{ .checkpoint = checkpoint } },
+            .{ .recovery_checkpoint_set = .{ .checkpoint = bound } },
             timestamp_ms,
-            .retry_expected_tail,
-            .{},
         ) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             else => return error.SessionCommitFailed,
@@ -436,30 +612,30 @@ pub const TurnContext = struct {
     }
 };
 
-pub const NormalAgentError = error{
-    OutOfMemory,
-    Cancelled,
-    AgentExecutionFailed,
-};
+pub fn failureDiagnosticValue(code: []const u8, detail: []const u8) types.ModelFailureDiagnostic {
+    const max_bytes = types.ModelFailureDiagnostic.max_bytes;
+    const prefix = text_utils.utf8PrefixByBytes(code, max_bytes);
+    const safe_detail = if (text_utils.isTerminalSafe(detail))
+        text_utils.utf8PrefixByBytes(detail, max_bytes -| prefix.len -| 2)
+    else
+        "";
+    if (safe_detail.len == 0) return types.ModelFailureDiagnostic.init(prefix);
+    var buffer: [max_bytes]u8 = undefined;
+    const text = std.fmt.bufPrint(&buffer, "{s}: {s}", .{ prefix, safe_detail }) catch unreachable;
+    return types.ModelFailureDiagnostic.init(text);
+}
 
-pub fn runNormalAgentTurn(
-    agent: *agent_runtime.Agent,
-    deps: *const runtime_deps.AgentRuntimeDeps,
-    semantic_presentation: ?runtime_assistant_stream.SemanticPresentationSink,
-    lifecycle: runtime_lifecycle.LifecycleContext,
-    config: runtime_config.Config,
-    prompt: worker_runtime.QueuedPrompt,
-) NormalAgentError!void {
-    agent_runtime.processAgentPrompt(
-        agent,
-        deps,
-        semantic_presentation,
-        lifecycle,
-        config,
-        prompt,
-    ) catch |err| return switch (err) {
-        error.OutOfMemory => error.OutOfMemory,
-        error.Cancelled => error.Cancelled,
-        else => error.AgentExecutionFailed,
-    };
+test "subagent failure capture is bounded and keeps the first cause without allocation" {
+    var turn: TurnContext = undefined;
+    turn.failure_diagnostic = null;
+    turn.setFailureDiagnostic("agent_turn_failed", "SessionCommitFailed");
+    turn.setFailureDiagnostic("cleanup", "OutOfMemory");
+    const retained = turn.failureDiagnostic().?;
+    turn.failure_diagnostic = null;
+    try std.testing.expectEqualStrings("agent_turn_failed: SessionCommitFailed", retained.view());
+    const long = failureDiagnosticValue("stage", "界" ** 200);
+    try std.testing.expect(long.view().len <= types.ModelFailureDiagnostic.max_bytes);
+    try std.testing.expect(std.unicode.utf8ValidateSlice(long.view()));
+    const unsafe = failureDiagnosticValue("provider_http_error", "unsafe\x1b[31m");
+    try std.testing.expectEqualStrings("provider_http_error", unsafe.view());
 }

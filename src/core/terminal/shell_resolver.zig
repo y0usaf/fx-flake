@@ -8,6 +8,7 @@ const self_exe = @import("../shared/self_exe.zig");
 const Allocator = std.mem.Allocator;
 
 pub const ResolveError = error{
+    MissingLoginShell,
     RelativeShellPath,
     UnsupportedShell,
 };
@@ -16,6 +17,25 @@ pub const Profile = command_environment.Profile;
 pub const Environment = command_environment.Environment;
 
 const rush_executable_token = "fx";
+
+const ShellKind = enum { bash, zsh };
+
+fn shellKind(path: []const u8) ?ShellKind {
+    const basename = std.fs.path.basename(path);
+    if (std.mem.eql(u8, basename, "bash")) return .bash;
+    if (std.mem.eql(u8, basename, "zsh")) return .zsh;
+    return null;
+}
+
+fn fallbackLoginShell() []const u8 {
+    return if (builtin.os.tag == .macos) "/bin/zsh" else "/bin/bash";
+}
+
+fn supportedLoginShell(configured_login_shell: ?[]const u8) ResolveError![]const u8 {
+    const path = configured_login_shell orelse return error.MissingLoginShell;
+    if (!std.fs.path.isAbsolute(path)) return error.RelativeShellPath;
+    return if (shellKind(path) != null) path else fallbackLoginShell();
+}
 
 pub const Invocation = struct {
     path: []const u8,
@@ -93,12 +113,29 @@ pub fn resolve(
     configured_login_shell: ?[]const u8,
     shell: contracts.ShellSpec,
 ) ResolveError!Invocation {
-    _ = configured_login_shell;
-    const clean_start = switch (shell) {
-        .user_login => false,
-        .executable => |value| value.clean_start,
+    const Selection = struct { path: []const u8, clean_start: bool };
+    const selection: Selection = switch (shell) {
+        .user_login => .{ .path = try supportedLoginShell(configured_login_shell), .clean_start = false },
+        .executable => |value| .{ .path = value.path, .clean_start = value.clean_start },
     };
-    return rushInvocation(null, clean_start);
+    if (!std.fs.path.isAbsolute(selection.path)) return error.RelativeShellPath;
+    const kind = shellKind(selection.path) orelse return error.UnsupportedShell;
+    var result = Invocation{ .path = selection.path };
+    result.append(selection.path);
+    switch (kind) {
+        .bash => {
+            if (selection.clean_start) {
+                result.append("--noprofile");
+                result.append("--norc");
+            } else result.append("--login");
+            result.append("-i");
+        },
+        .zsh => {
+            if (selection.clean_start) result.append("-f") else result.append("-l");
+            result.append("-i");
+        },
+    }
+    return result;
 }
 
 pub fn configuredLoginShellInto(buffer: []u8) ?[]const u8 {
@@ -156,13 +193,21 @@ pub fn profileShell(
     configured_login_shell: ?[]const u8,
     profile: Profile,
 ) (ResolveError || Allocator.Error)!contracts.ShellSpec {
-    _ = configured_login_shell;
     return switch (profile) {
-        .clean => .{ .executable = .{
-            .path = try alloc.dupe(u8, rush_executable_token),
-            .clean_start = true,
-        } },
-        .user => .user_login,
+        .clean => blk: {
+            const path = try supportedLoginShell(configured_login_shell);
+            _ = try resolve(null, .{ .executable = .{ .path = path, .clean_start = true } });
+            break :blk .{ .executable = .{
+                .path = try alloc.dupe(u8, path),
+                .clean_start = true,
+            } };
+        },
+        .user => blk: {
+            const configured = configured_login_shell orelse break :blk .user_login;
+            const path = try supportedLoginShell(configured);
+            if (std.mem.eql(u8, path, configured)) break :blk .user_login;
+            break :blk .{ .executable = .{ .path = try alloc.dupe(u8, path) } };
+        },
     };
 }
 
@@ -173,9 +218,27 @@ pub fn capturedInvocation(
 ) (ResolveError || Allocator.Error)!Invocation {
     switch (environment_value) {
         .legacy, .workspace_clean => return error.UnsupportedShell,
-        .clean, .user => {},
+        .clean => |path| {
+            if (std.mem.eql(u8, path, rush_executable_token))
+                return capturedSelfInvocation(alloc, true, command);
+            var invocation = try resolve(null, .{ .executable = .{ .path = path, .clean_start = true } });
+            removeInteractiveFlag(&invocation);
+            invocation.setCommand(command);
+            return invocation;
+        },
+        .user => |path| {
+            if (std.mem.eql(u8, path, rush_executable_token))
+                return capturedSelfInvocation(alloc, false, command);
+            var invocation = try resolve(path, .user_login);
+            if (shellKind(path) == .bash) {
+                removeInteractiveFlag(&invocation);
+                invocation.append("-O");
+                invocation.append("expand_aliases");
+            }
+            invocation.setCommand(command);
+            return invocation;
+        },
     }
-    return capturedSelfInvocation(alloc, false, command);
 }
 
 pub fn formatInvocationCommand(
@@ -281,6 +344,32 @@ fn appendShellWord(
         }
     }
     try output.append(alloc, '\'');
+}
+
+test "shell resolver preserves explicit Bash and zsh startup contracts" {
+    const bash = try resolve("/bin/bash", .{ .executable = .{ .path = "/opt/bin/bash" } });
+    try std.testing.expectEqualStrings("/opt/bin/bash", bash.path);
+    try std.testing.expectEqualStrings("/opt/bin/bash", bash.argv()[0]);
+    try std.testing.expectEqualStrings("--login", bash.argv()[1]);
+    try std.testing.expectEqualStrings("-i", bash.argv()[2]);
+
+    const clean_zsh = try resolve("/bin/zsh", .{ .executable = .{ .path = "/opt/bin/zsh", .clean_start = true } });
+    try std.testing.expectEqualStrings("/opt/bin/zsh", clean_zsh.path);
+    try std.testing.expectEqualStrings("-f", clean_zsh.argv()[1]);
+    try std.testing.expectEqualStrings("-i", clean_zsh.argv()[2]);
+}
+
+test "shell resolver keeps default rush clean capture isolated from PATH" {
+    const invocation = try capturedInvocation(
+        std.testing.allocator,
+        .{ .clean = rush_executable_token },
+        "printf clean",
+    );
+    defer std.testing.allocator.free(invocation.path);
+    try std.testing.expect(std.fs.path.isAbsolute(invocation.path));
+    try std.testing.expectEqualStrings(rush_internal_mode, invocation.argv()[1]);
+    try std.testing.expectEqualStrings("-c", invocation.argv()[2]);
+    try std.testing.expectEqualStrings("printf clean", invocation.argv()[3]);
 }
 
 test "bootstrap quotes private paths and separates command completion" {

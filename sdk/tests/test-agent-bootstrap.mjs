@@ -30,7 +30,7 @@ if (!child) {
   const nativeAddon = resolve(scriptDir, "../../zig-out/lib/libfx.node");
   const wasm = backend === "native"
     ? undefined
-    : await readFile(resolve(scriptDir, "../../zig-out/bin/fx-core.wasm"));
+    : await readFile(resolve(scriptDir, "../../zig-out/bin/omfx-core.wasm"));
   const options = {
     backend,
     nativeAddon,

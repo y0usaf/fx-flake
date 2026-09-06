@@ -36,6 +36,7 @@ if (ambientTraceChild) {
 
 for (const [name, args] of [
   ["createCore", []],
+  ["takeCoreReadyFd", []],
   ["writeCore", []],
   ["writeCore", [{}]],
   ["closeCore", []],
@@ -156,7 +157,17 @@ try {
   const sessionId = created.result.sessionId;
 
   const firstPrompt = sendPrompt(sessionId, "first low-level prompt");
+  const catalogFetch = await Promise.race([takeFetch(), timeout("model catalog fetch")]);
+  assert.equal(catalogFetch.method, "GET");
+  assert.equal(catalogFetch.url, "https://ai-gateway.vercel.sh/coding-agent/v1/models");
+  assert.equal(addon.startCoreFetchResponse(lifecycleCore, catalogFetch.handle, 200), 1);
+  assert.equal(addon.pushCoreFetchResponse(lifecycleCore, catalogFetch.handle, Buffer.from(JSON.stringify({
+    object: "list", data: [{ id: "native/test-model", type: "language" }],
+  }))), 1);
+  assert.equal(addon.finishCoreFetch(lifecycleCore, catalogFetch.handle), 1);
   const firstFetch = await Promise.race([takeFetch(), timeout("first host fetch")]);
+  assert.equal(firstFetch.method, "POST");
+  assert.equal(firstFetch.url, "http://127.0.0.1:31337/chat");
   assert.ok(Number.isInteger(firstFetch.handle) && firstFetch.handle > 0, "fetch request must carry a positive handle");
   const firstHandle = firstFetch.handle;
   const futureHandle = firstHandle + 1;
@@ -172,6 +183,7 @@ try {
 
   const secondPrompt = sendPrompt(sessionId, "second low-level prompt");
   const secondFetch = await Promise.race([takeFetch(), timeout("second host fetch")]);
+  assert.equal(secondFetch.method, "POST");
   assert.notEqual(secondFetch.handle, firstHandle, "sequential fetches must use unique handles");
   const secondHandle = secondFetch.handle;
   assert.equal(addon.startCoreFetchResponse(lifecycleCore, firstHandle, 200), 0);

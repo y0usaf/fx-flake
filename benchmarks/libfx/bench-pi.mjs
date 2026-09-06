@@ -5,6 +5,12 @@ import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import {
+  benchmarkInstructions,
+  benchmarkInstructionsBytes,
+  benchmarkPrompt,
+  requestMetrics,
+} from "./workload.mjs";
 
 const scriptPath = fileURLToPath(import.meta.url);
 const repoRoot = resolve(fileURLToPath(new URL("../..", import.meta.url)));
@@ -32,15 +38,26 @@ async function runChild() {
   if (!gatewayOrigin || !diagnosticsPath) throw new Error("benchmark child environment is incomplete");
 
   const startedAt = performance.now();
-  const { createAgentSession, SessionManager } = await import(piEntry());
+  const {
+    createAgentSession,
+    DefaultResourceLoader,
+    SessionManager,
+  } = await import(piEntry());
   const importedAt = performance.now();
   const nativeFetch = globalThis.fetch;
   let fetchAt = null;
   let firstBodyAt = null;
   let firstTextAt = null;
+  let nonPromptFetches = 0;
+  let promptRequestMetrics = null;
   globalThis.fetch = async (url, init = {}) => {
     const isPrompt = (init.method ?? "GET") === "POST";
-    if (isPrompt) fetchAt ??= performance.now();
+    if (isPrompt) {
+      fetchAt ??= performance.now();
+      promptRequestMetrics ??= requestMetrics(init.body);
+    } else {
+      nonPromptFetches += 1;
+    }
     const response = await nativeFetch(url, init);
     if (!isPrompt || !response.body) return response;
     const reader = response.body.getReader();
@@ -77,9 +94,22 @@ async function runChild() {
     contextWindow: 128_000,
     maxTokens: 4096,
   };
+  const resourceLoader = new DefaultResourceLoader({
+    cwd: repoRoot,
+    agentDir: `${diagnosticsPath}.agent`,
+    systemPrompt: benchmarkInstructions,
+    appendSystemPrompt: [],
+    noExtensions: true,
+    noSkills: true,
+    noPromptTemplates: true,
+    noThemes: true,
+    noContextFiles: true,
+  });
+  await resourceLoader.reload();
   const { session } = await createAgentSession({
     cwd: repoRoot,
     model,
+    resourceLoader,
     noTools: "all",
     sessionManager: SessionManager.inMemory(),
   });
@@ -101,7 +131,7 @@ async function runChild() {
     process.stdout.write(event.assistantMessageEvent.delta);
   });
   const promptAt = performance.now();
-  await session.prompt("Reply with hello.");
+  await session.prompt(benchmarkPrompt);
   unsubscribe();
   session.dispose();
   const finishedAt = performance.now();
@@ -115,6 +145,8 @@ async function runChild() {
     firstBodyAt,
     firstTextAt,
     finishedAt,
+    nonPromptFetches,
+    ...promptRequestMetrics,
     text,
     observedEvents,
   }));
@@ -190,6 +222,9 @@ async function runSample(gatewayOrigin, diagnosticsPath) {
       throw new Error(`pi benchmark child omitted ${field}; stdout=${JSON.stringify(stdout)} stderr=${JSON.stringify(stderr)} diagnostics=${JSON.stringify(diagnostics)}`);
     }
   }
+  if (diagnostics.text !== "hello" || stdout !== "hello") {
+    throw new Error(`pi benchmark child did not produce the expected response: stdout=${JSON.stringify(stdout)} diagnostics=${JSON.stringify(diagnostics)}`);
+  }
   return {
     text: stdout,
     spawn_to_first_stdout_ms: firstStdoutAt - spawnedAt,
@@ -198,5 +233,9 @@ async function runSample(gatewayOrigin, diagnosticsPath) {
     total_ms: exitedAt - spawnedAt,
     import_ms: diagnostics.importedAt - diagnostics.startedAt,
     create_agent_ms: diagnostics.agentReadyAt - diagnostics.importedAt,
+    non_prompt_fetches: diagnostics.nonPromptFetches,
+    request_bytes: diagnostics.request_bytes,
+    system_context_bytes: diagnostics.system_context_bytes,
+    system_context_overhead_bytes: diagnostics.system_context_bytes - benchmarkInstructionsBytes,
   };
 }

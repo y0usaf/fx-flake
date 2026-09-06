@@ -7,6 +7,8 @@ const io_mod = @import("../core/shared/io.zig");
 const secret = @import("../core/auth/secret.zig");
 const types = @import("../core/shared/types.zig");
 const gateway_client = @import("client.zig");
+const versions = @import("../core/gateway/provider_versions.zig");
+const version_lookup = @import("provider_versions.zig");
 
 const max_catalog_models: usize = 128;
 const max_model_id_bytes: usize = 256;
@@ -19,6 +21,8 @@ const e2e_modalities_endpoint_env = "FX_E2E_XAI_GROK_MODALITIES_URL";
 
 pub const model_catalog_provider = model_catalog.Provider{
     .fetch_fn = fetchCatalogForProvider,
+    .provider_id = .grok,
+    .refresh_interval_ms = versions.refresh_interval_ms,
 };
 
 pub const cli_model_catalog_provider = gateway_provider.CliModelCatalogProvider{
@@ -82,12 +86,20 @@ fn fetchCatalogForProvider(
         .clock = .awake,
         .raw = .fromMilliseconds(fetch_timeout_ms),
     });
+    const version = if (request_auth.include_subscription_headers)
+        version_lookup.resolve(alloc, .grok, cancel_flag, deadline) catch |err| {
+            if (err == error.OutOfMemory) return error.OutOfMemory;
+            return .{ .failure = catalogFetchFailure(err) };
+        }
+    else
+        null;
     var response = fetchCatalogResponse(
         alloc,
         request_url,
         request_auth.credential,
         request_auth.account_id,
         request_auth.include_subscription_headers,
+        version,
         cancel_flag,
         deadline,
     ) catch |err| {
@@ -104,6 +116,7 @@ fn fetchCatalogForProvider(
         request_auth.credential,
         null,
         false,
+        null,
         cancel_flag,
         deadline,
     ) catch |err| {
@@ -165,6 +178,7 @@ const FetchOperation = struct {
     credential: ?[]const u8,
     account_id: ?[]const u8,
     include_subscription_headers: bool,
+    client_version: ?versions.Version = null,
 
     pub fn run(self: *@This()) !FetchResponse {
         var client: std.http.Client = .{ .allocator = self.alloc, .io = io_mod.getIo() };
@@ -182,7 +196,7 @@ const FetchOperation = struct {
         const body_buffer = try self.alloc.alloc(u8, max_catalog_bytes + 1);
         defer secret.zeroAndFree(self.alloc, body_buffer);
         var response_writer = std.Io.Writer.fixed(body_buffer);
-        var extra_headers_buffer: [3]std.http.Header = undefined;
+        var extra_headers_buffer: [5]std.http.Header = undefined;
         var extra_headers_len: usize = 0;
         extra_headers_buffer[extra_headers_len] = .{ .name = "accept", .value = "application/json" };
         extra_headers_len += 1;
@@ -192,6 +206,12 @@ const FetchOperation = struct {
         }
         if (self.account_id) |account_id| {
             extra_headers_buffer[extra_headers_len] = .{ .name = "x-userid", .value = account_id };
+            extra_headers_len += 1;
+        }
+        if (self.client_version) |*version| {
+            extra_headers_buffer[extra_headers_len] = .{ .name = "x-grok-client-version", .value = version.slice() };
+            extra_headers_len += 1;
+            extra_headers_buffer[extra_headers_len] = .{ .name = "x-grok-client-identifier", .value = "fx" };
             extra_headers_len += 1;
         }
         const result = client.fetch(.{
@@ -220,6 +240,7 @@ fn fetchCatalogResponse(
     credential: ?[]const u8,
     account_id: ?[]const u8,
     include_subscription_headers: bool,
+    client_version: ?versions.Version,
     cancel_flag: *std.atomic.Value(bool),
     deadline: std.Io.Clock.Timestamp,
 ) !FetchResponse {
@@ -229,6 +250,7 @@ fn fetchCatalogResponse(
         .credential = credential,
         .account_id = account_id,
         .include_subscription_headers = include_subscription_headers,
+        .client_version = client_version,
     };
     return gateway_client.runBoundedHttpOperation(
         FetchResponse,
@@ -712,6 +734,7 @@ const CatalogEndpointEnvironment = struct {
         errdefer self.map.deinit();
         try self.map.put(e2e_models_endpoint_env, models_url);
         try self.map.put(e2e_modalities_endpoint_env, modalities_url);
+        try self.map.put("FX_E2E_GROK_CLIENT_VERSION", "1.0.6");
         io_mod.setEnvironMap(&self.map);
         return self;
     }

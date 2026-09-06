@@ -735,8 +735,9 @@ fn parseOptionalToolCall(alloc: Allocator, maybe_value: ?std.json.Value) !?sessi
         .object => try parseToolCall(alloc, value),
         else => return error.InvalidSessionFormat,
     };
+    errdefer if (call) |owned| session.freeToolCall(alloc, owned);
     if (call) |*parsed| {
-        session.repairPersistedInterruptedToolArguments(parsed, .legacy);
+        try session.repairPersistedInterruptedToolArguments(alloc, parsed, .legacy);
     }
     return call;
 }
@@ -748,8 +749,8 @@ fn parseToolCall(alloc: Allocator, value: std.json.Value) !session.ToolCall {
     const name = try alloc.dupe(u8, try requireString(object, "name"));
     errdefer alloc.free(name);
     const raw_arguments_json = try requireString(object, "arguments_json");
-    const argument_integrity = try types.ToolArgumentIntegrity.classifySerialized(alloc, raw_arguments_json);
-    const arguments_json = try alloc.dupe(u8, if (argument_integrity == .valid) raw_arguments_json else "{}");
+    const argument_integrity = try types.ToolArgumentIntegrity.classifyFunctionInput(alloc, raw_arguments_json);
+    const arguments_json = try alloc.dupe(u8, if (argument_integrity == .malformed_json) "{}" else raw_arguments_json);
     errdefer alloc.free(arguments_json);
     const provider_result = try optionalStringDup(alloc, object.get("provider_result"));
     errdefer if (provider_result) |result| alloc.free(result);
@@ -1737,6 +1738,57 @@ test "session JSON persists malformed argument recovery as a safe failed pair" {
     try std.testing.expectEqual(.valid, execution.tool_steps[0].tool_calls[0].argument_integrity);
     try std.testing.expectEqual(session.PersistedToolStatus.failure, execution.tool_steps[0].tool_results[0].status);
     try std.testing.expectEqualStrings(failure_output, execution.tool_steps[0].tool_results[0].output);
+}
+
+test "non-object legacy function inputs are repaired without changing recorded outcomes" {
+    const alloc = std.testing.allocator;
+    for ([_]session.PersistedToolStatus{ .success, .failure }) |status| {
+        for (0..3) |native_kind| {
+            var calls = [_]session.ToolCall{.{ .id = "call", .name = "read_file", .arguments_json = "[]" }};
+            calls[0].provider_result = if (native_kind == 1) "provider result" else null;
+            var results = [_]session.PersistedToolResult{.{
+                .tool_call_id = @constCast("call"),
+                .tool_name = @constCast("read_file"),
+                .status = status,
+                .output = @constCast("recorded"),
+                .output_bytes = 8,
+                .stored_output_bytes = 8,
+                .truncated = false,
+                .provider_native = native_kind == 2,
+                .created_at_ms = 1,
+            }};
+            var steps = [_]session.ToolExecutionStep{.{ .tool_calls = &calls, .tool_results = &results }};
+            var encoded: std.Io.Writer.Allocating = .init(alloc);
+            defer encoded.deinit();
+            try writeExecutionMemoryJson(&encoded.writer, .{ .tool_steps = &steps });
+            var parsed = try std.json.parseFromSlice(std.json.Value, alloc, encoded.written(), .{});
+            defer parsed.deinit();
+            const decoded = try parseOptionalExecutionMemory(alloc, parsed.value);
+            defer session.freeExecutionMemory(alloc, decoded);
+            const step = decoded.tool_steps[0];
+            try std.testing.expectEqualStrings(if (native_kind == 0) "{}" else "[]", step.tool_calls[0].arguments_json);
+            try std.testing.expectEqual(if (native_kind == 0) types.ToolExecutionProvenance.fx_local else .provider_executed, step.tool_calls[0].provenance);
+            try std.testing.expectEqual(types.ToolArgumentIntegrity.valid, step.tool_calls[0].argument_integrity);
+            try std.testing.expectEqual(status, step.tool_results[0].status);
+            try std.testing.expectEqualStrings("recorded", step.tool_results[0].output);
+            try std.testing.expectEqual(@as(usize, 8), step.tool_results[0].stored_output_bytes);
+        }
+    }
+}
+
+fn checkNonObjectLegacyInterruptedAllocationFailures(alloc: Allocator, value: std.json.Value) !void {
+    const call = (try parseOptionalToolCall(alloc, value)).?;
+    defer session.freeToolCall(alloc, call);
+    try std.testing.expectEqualStrings("{}", call.arguments_json);
+}
+
+test "non-object legacy interrupted repair cleans every allocation failure" {
+    const alloc = std.testing.allocator;
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc,
+        \\{"id":"pending","name":"read_file","arguments_json":"[]","provider_result":null}
+    , .{});
+    defer parsed.deinit();
+    try std.testing.checkAllAllocationFailures(alloc, checkNonObjectLegacyInterruptedAllocationFailures, .{parsed.value});
 }
 
 test "old assistant session JSON without execution parses as empty memory" {

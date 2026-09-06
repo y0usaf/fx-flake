@@ -4721,18 +4721,25 @@ test "natural command completion terminates redirected descendant after setsid" 
     defer alloc.free(workspace);
     const pid_path = try std.fs.path.join(alloc, &.{ workspace, "escaped-child.pid" });
     defer alloc.free(pid_path);
+    // Natural cleanup may kill the child before it publishes its PID unless
+    // the parent waits for readiness after setsid and stream redirection.
     const command = try std.fmt.allocPrint(
         alloc,
         "python3 -c 'import os,time\n" ++
+            "ready_r,ready_w=os.pipe()\n" ++
             "pid=os.fork()\n" ++
             "if pid == 0:\n" ++
+            " os.close(ready_r)\n" ++
             " os.setsid()\n" ++
             " null=os.open(\"/dev/null\",os.O_RDWR)\n" ++
             " os.dup2(null,0); os.dup2(null,1); os.dup2(null,2)\n" ++
-            " open(\"{s}\",\"w\").write(str(os.getpid()))\n" ++
+            " with open(\"{s}\",\"w\") as f: f.write(str(os.getpid()))\n" ++
+            " os.write(ready_w,b\"R\"); os.close(ready_w)\n" ++
             " time.sleep(30)\n" ++
             "else:\n" ++
-            " pass'",
+            " os.close(ready_w)\n" ++
+            " if os.read(ready_r,1) != b\"R\": raise SystemExit(1)\n" ++
+            " os.close(ready_r)'",
         .{pid_path},
     );
     defer alloc.free(command);

@@ -83,6 +83,7 @@ fn buildGatewayReview(
     alloc: Allocator,
     _: []const u8,
     tools_json: []const u8,
+    instructions: []const types.ChatMessage,
     messages: []const types.ChatMessage,
     target_call_id: []const u8,
     deadline: std.Io.Clock.Timestamp,
@@ -91,6 +92,7 @@ fn buildGatewayReview(
     return vercel_protocol.buildGatewayPendingToolReviewRequestBodyWithMaxOutputTokens(
         alloc,
         tools_json,
+        instructions,
         messages,
         target_call_id,
         .{},

@@ -41,11 +41,12 @@ pub const Destination = struct {
     }
 
     pub fn writeHyperlinkLabel(self: Destination, writer: *std.Io.Writer) !void {
+        try writer.writeByte('(');
         try writer.writeAll("\x1b]8;;");
         try self.writeUrl(writer);
-        try writer.writeAll("\x1b\\\x1b[4m(");
+        try writer.writeAll("\x1b\\\x1b[4m");
         try writeLabel(self.kind, writer);
-        try writer.writeAll(")\x1b[24m\x1b]8;;\x1b\\");
+        try writer.writeAll("\x1b[24m\x1b]8;;\x1b\\)");
     }
 };
 
@@ -144,18 +145,38 @@ test "dev destination treats a short previous revision as the same commit" {
     );
 }
 
-test "destination writes a compact OSC 8 hyperlink label" {
-    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
-    defer out.deinit();
-
-    const value = destination(.stable, "0.0.8", "", "") orelse
+test "destination links only the label, not its parentheses" {
+    const stable = destination(.stable, "0.0.8", "", "") orelse
         return error.TestExpectedDestination;
-    try value.writeHyperlinkLabel(&out.writer);
-    try std.testing.expectEqualStrings(
-        "\x1b]8;;https://fx.sh/changelog#v0.0.8\x1b\\" ++
-            "\x1b[4m(notes)\x1b[24m\x1b]8;;\x1b\\",
-        out.writer.buffered(),
-    );
+    const dev = destination(
+        .dev,
+        "0.0.8",
+        "1111111111111111111111111111111111111111",
+        "abcdef0123456789abcdef0123456789abcdef01",
+    ) orelse return error.TestExpectedDestination;
+
+    const cases = [_]struct {
+        value: Destination,
+        expected: []const u8,
+    }{
+        .{
+            .value = stable,
+            .expected = "(\x1b]8;;https://fx.sh/changelog#v0.0.8\x1b\\" ++
+                "\x1b[4mnotes\x1b[24m\x1b]8;;\x1b\\)",
+        },
+        .{
+            .value = dev,
+            .expected = "(\x1b]8;;https://github.com/vercel-labs/fx/compare/1111111111111111111111111111111111111111...abcdef0123456789abcdef0123456789abcdef01\x1b\\" ++
+                "\x1b[4mchanges\x1b[24m\x1b]8;;\x1b\\)",
+        },
+    };
+
+    for (cases) |case| {
+        var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+        defer out.deinit();
+        try case.value.writeHyperlinkLabel(&out.writer);
+        try std.testing.expectEqualStrings(case.expected, out.writer.buffered());
+    }
 }
 
 test "invalid build identity has no destination" {

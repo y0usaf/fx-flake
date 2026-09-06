@@ -64,7 +64,7 @@ jobs:
           if-no-files-found: warn
 
   libfx-ttft:
-    name: libfx TTFT (report only)
+    name: libfx Runtime
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -82,7 +82,7 @@ jobs:
       - name: Setup Bun
         uses: oven-sh/setup-bun@v2
         with:
-          bun-version: "1.3.14"
+          bun-version: "1.4.2"
 
       - name: Build libfx artifacts
         run: |
@@ -92,15 +92,31 @@ jobs:
       - name: Install pinned Pi benchmark target
         run: npm install --prefix /tmp/libfx-pi @earendil-works/pi-coding-agent@0.84.4
 
+      - name: Build external inference fixture
+        run: zig build-exe benchmarks/libfx/fake-inference-server.zig -O ReleaseSafe -femit-bin=${{ runner.temp }}/libfx-fake-inference-server
+
       - name: Measure libfx and Pi
         run: |
-          node benchmarks/libfx/bench-suite.mjs --samples 20 --pi-root /tmp/libfx-pi --out benchmarks/results/libfx
-          node benchmarks/libfx/bench-bridge.mjs --backend native --samples 20 > benchmarks/results/libfx/bridge-node-native.json
-          node --experimental-wasm-jspi benchmarks/libfx/bench-bridge.mjs --backend wasm --samples 20 > benchmarks/results/libfx/bridge-node-wasm.json
-          bun benchmarks/libfx/bench-bridge.mjs --backend native --samples 20 > benchmarks/results/libfx/bridge-bun-native.json
-          bun benchmarks/libfx/bench-bridge.mjs --backend wasm --samples 20 > benchmarks/results/libfx/bridge-bun-wasm.json
+          node benchmarks/libfx/bench-suite.mjs --samples 100 --pi-root /tmp/libfx-pi --out benchmarks/results/libfx
+          node benchmarks/libfx/bench-bridge.mjs --backend native --samples 100 > benchmarks/results/libfx/bridge-node-native.json
+          node --experimental-wasm-jspi benchmarks/libfx/bench-bridge.mjs --backend wasm --samples 100 > benchmarks/results/libfx/bridge-node-wasm.json
+          bun benchmarks/libfx/bench-bridge.mjs --backend native --samples 100 > benchmarks/results/libfx/bridge-bun-native.json
+          bun benchmarks/libfx/bench-bridge.mjs --backend wasm --samples 100 > benchmarks/results/libfx/bridge-bun-wasm.json
+          node benchmarks/libfx/bench-runtime.mjs --backend native --warm-samples 100 --stream-samples 30 > benchmarks/results/libfx/runtime-node-native.json
+          node --experimental-wasm-jspi benchmarks/libfx/bench-runtime.mjs --backend wasm --warm-samples 100 --stream-samples 30 > benchmarks/results/libfx/runtime-node-wasm.json
+          bun benchmarks/libfx/bench-runtime.mjs --backend native --warm-samples 100 --stream-samples 30 > benchmarks/results/libfx/runtime-bun-native.json
+          bun benchmarks/libfx/bench-runtime.mjs --backend wasm --warm-samples 100 --stream-samples 30 > benchmarks/results/libfx/runtime-bun-wasm.json
+          node --expose-gc benchmarks/libfx/bench-capacity.mjs --backend native --count 25 > benchmarks/results/libfx/capacity-node-native.json
+          node --experimental-wasm-jspi --expose-gc benchmarks/libfx/bench-capacity.mjs --backend wasm --count 25 > benchmarks/results/libfx/capacity-node-wasm.json
+          bun benchmarks/libfx/bench-capacity.mjs --backend native --count 25 > benchmarks/results/libfx/capacity-bun-native.json
+          bun benchmarks/libfx/bench-capacity.mjs --backend wasm --count 25 > benchmarks/results/libfx/capacity-bun-wasm.json
+          node benchmarks/libfx/bench-competitive.mjs --server ${{ runner.temp }}/libfx-fake-inference-server --pi-root /tmp/libfx-pi --out benchmarks/results/libfx --samples 100 --warmups 3 --rounds 3
+
+      - name: Enforce deterministic libfx contracts
+        run: node benchmarks/libfx/check-results.mjs --dir benchmarks/results/libfx
 
       - name: Upload raw libfx TTFT samples
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: libfx-ttft-${{ github.sha }}

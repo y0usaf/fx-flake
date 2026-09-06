@@ -12,8 +12,19 @@ import {
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
-export const FX_BIN = resolve(import.meta.dirname, "../../zig-out/bin/fx");
+export const FX_BIN = resolve(import.meta.dirname, "../../zig-out/bin/omfx");
 export const REPO_ROOT = resolve(import.meta.dirname, "../..");
+
+export function providerVersionTestEnv(env: Record<string, string | undefined>): Record<string, string | undefined> {
+  const result = { ...env };
+  if (env.FX_E2E_OPENAI_CODEX_MODELS_URL && !env.FX_E2E_CODEX_VERSION_URL && !env.FX_E2E_CODEX_CLIENT_VERSION) {
+    result.FX_E2E_CODEX_CLIENT_VERSION = "0.153.0";
+  }
+  if ((env.FX_E2E_XAI_GROK_MODELS_URL || env.FX_E2E_XAI_GROK_RESPONSES_URL) && !env.FX_E2E_GROK_VERSION_URL && !env.FX_E2E_GROK_CLIENT_VERSION) {
+    result.FX_E2E_GROK_CLIENT_VERSION = "1.0.6";
+  }
+  return result;
+}
 
 export const EVAL_MODELS = [
   "anthropic/claude-sonnet-4.6",
@@ -442,7 +453,7 @@ function captureFxProcessState(): string {
     return execFileSync("ps", ["-axo", "pid,ppid,stat,etime,command"], {
       encoding: "utf8",
     }).split("\n").filter((line) =>
-      line.includes("/zig-out/bin/fx") ||
+      line.includes("/zig-out/bin/omfx") ||
       line.includes("mcp-modern-") ||
       line.includes("mcp-legacy-") ||
       line.includes("bun test")
@@ -483,7 +494,7 @@ export async function runFx(
       }
     }
     const child = nodeSpawn(FX_BIN, args, {
-      env,
+      env: providerVersionTestEnv(env),
       cwd: cwd ?? REPO_ROOT,
       stdio: ["pipe", "pipe", "pipe"],
     });

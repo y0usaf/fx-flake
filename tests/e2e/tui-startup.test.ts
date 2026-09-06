@@ -312,7 +312,7 @@ describe.skipIf(SKIP_TMUX)("tui: MCP startup", () => {
         port: 0,
         async fetch(request) {
           const body = await request.text();
-          if (body.includes('"method":"server/discover"')) discoveryRequests += 1;
+          if (body.includes('"method":"initialize"')) discoveryRequests += 1;
           return await new Promise<Response>(() => {});
         },
       });

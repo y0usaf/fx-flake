@@ -637,6 +637,296 @@ test "same completion duplicate skill calls both execute for explicit rereads" {
     try std.testing.expectEqualStrings("loaded skill", results[1].output);
 }
 
+test "custom tool named skill does not use builtin skill preparation" {
+    const alloc = std.testing.allocator;
+    const contracts = @import("../../../skills/skill_contract.zig");
+    const Unexpected = struct {
+        fn prepare(_: *anyopaque, _: std.mem.Allocator, _: ToolCall, _: ?*const contracts.Locations) anyerror!contracts.CallPreparation {
+            return error.UnexpectedSkillPreparation;
+        }
+    };
+    var custom = builtin_tools.skill;
+    custom.prepare_skill_call_fn = null;
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    hooks.tool_registry = .{ .tools = &.{custom} };
+    var gateway = FakeGateway.init(alloc, &.{
+        .{ .tool_calls = &.{.{ .id = "custom", .name = "skill", .arguments_json = "{\"name\":\"custom-contract\"}" }} },
+        .{ .content = "final" },
+    });
+    defer gateway.deinit();
+    var deps = hooks.deps();
+    deps.prepare_skill_call = Unexpected.prepare;
+    deps.agent_stream_provider = gateway.provider();
+    var fixture = PromptFixture{};
+    var agent: @import("../agent.zig").Agent = .{};
+    defer agent.deinit(alloc);
+    try runtime_orchestrator.processAgentPrompt(&agent, &deps, null, testLifecycleContext(lifecycle_hooks.RuntimeView.empty(), alloc, fixture.workspace_root), fixture.config(), fixture.job());
+    try std.testing.expectEqual(@as(usize, 1), hooks.permission_names.items.len);
+    try std.testing.expectEqual(@as(usize, 1), hooks.executed_names.items.len);
+}
+
+test "parallel skill admission binds identities preserves denies and isolates failures" {
+    const alloc = std.testing.allocator;
+    const contracts = @import("../../../skills/skill_contract.zig");
+    const admission = @import("../../../tooling/tool_admission.zig");
+    const Probe = struct {
+        workspace_root: []const u8,
+        registry: tool_dispatch.Registry,
+        rules: types.PermissionRuleSet,
+        worker: worker_runtime.WorkerRuntime = .{},
+        started: std.atomic.Value(usize) = .init(0),
+        admission_count: usize = 0,
+
+        fn prepare(raw: *anyopaque, arena: std.mem.Allocator, call: ToolCall, locations: ?*const contracts.Locations) anyerror!contracts.CallPreparation {
+            const hooks: *FakeAgentRuntimeDeps = @ptrCast(@alignCast(raw));
+            const self: *@This() = @ptrCast(@alignCast(hooks.execute_delegate.?.ctx));
+            return builtin_tools.skill.prepare_skill_call_fn.?(.{
+                .allocator = arena,
+                .workspace_root = self.workspace_root,
+                .skill_locations = locations,
+            }, call.arguments_json);
+        }
+
+        fn permission(raw: *anyopaque, arena: std.mem.Allocator, call: ToolCall, _: permission_auto_classifier.ReviewTurnContext, mode: types.PermissionMode, grants: []const PermissionGrant, _: ?runtime_tool_contracts.LiveToolAuthority, _: ?runtime_tool_contracts.LivePermissionRevalidation, _: []const []const u8) anyerror!command_admission.PermissionOutcome {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.admission_count += 1;
+            return admission.requestPermissionOutcome(.{
+                .workspace_root = self.workspace_root,
+                .permission_grants = &.{},
+                .permission_rules = self.rules,
+                .tool_registry = self.registry,
+                .worker = &self.worker,
+                .advertised_dynamic_tool_names = &.{},
+                .mcp_runtime = .{},
+            }, arena, call, mode, grants);
+        }
+
+        fn execute(raw: *anyopaque, request: runtime_tool_contracts.ToolExecutionRequest) anyerror!runtime_tool_contracts.ToolExecutionResult {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            _ = self.started.fetchAdd(1, .seq_cst);
+            const started_at = io_mod.milliTimestamp();
+            while (self.started.load(.seq_cst) < 2) {
+                if (io_mod.milliTimestamp() - started_at > 1000) return error.ExpectedConcurrentReads;
+                std.Thread.yield() catch std.atomic.spinLoopHint();
+            }
+            if (std.mem.eql(u8, request.call.name, "skill")) {
+                const selected = request.call.resolved_skill orelse return error.MissingSkillBinding;
+                try std.testing.expectEqualStrings("allowed-name", selected.skill.name);
+            }
+            var detail: ?[]u8 = null;
+            const result = try tool_dispatch.dispatchAuthorizedToolCall(.{
+                .allocator = request.result_allocator,
+                .workspace_root = self.workspace_root,
+                .execution_authority = request.authority,
+                .resolved_skill = request.call.resolved_skill,
+            }, self.registry, request.call, &detail);
+            return .{
+                .status = if (result.status == .success) .success else .failure,
+                .model_output = result.body,
+                .status_detail = detail,
+            };
+        }
+    };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "allowed");
+    try tmp.dir.createDirPath(io_mod.getIo(), "denied");
+    try tmp.dir.writeFile(io_mod.getIo(), .{ .sub_path = "allowed/SKILL.md", .data = "---\nname: allowed-name\n---\nMAIN\n" });
+    try tmp.dir.writeFile(io_mod.getIo(), .{ .sub_path = "allowed/reference.md", .data = "PARALLEL_ALLOWED_REFERENCE\n" });
+    try tmp.dir.writeFile(io_mod.getIo(), .{ .sub_path = "denied/SKILL.md", .data = "---\nname: denied-name\n---\nDENIED_BODY_MUST_NOT_LOAD\n" });
+    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(root);
+    const allowed_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "allowed");
+    defer alloc.free(allowed_path);
+    const denied_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "denied");
+    defer alloc.free(denied_path);
+    const allowed_args = try std.json.Stringify.valueAlloc(alloc, .{ .location = allowed_path, .resource = "reference.md" }, .{});
+    defer alloc.free(allowed_args);
+    const denied_args = try std.json.Stringify.valueAlloc(alloc, .{ .location = denied_path }, .{});
+    defer alloc.free(denied_args);
+    const catalog = [_]contracts.Skill{
+        .{ .name = "allowed-name", .description = "", .path = allowed_path, .source = .global_fx },
+        .{ .name = "denied-name", .description = "", .path = denied_path, .source = .global_fx },
+    };
+    var rules = [_]types.PermissionRule{
+        .{ .permission = @constCast("skill"), .pattern = @constCast("*"), .action = .allow },
+        .{ .permission = @constCast("skill"), .pattern = @constCast("denied-name"), .action = .deny },
+    };
+    var probe: Probe = .{ .workspace_root = root, .registry = .{ .tools = &.{ builtin_tools.skill, builtin_tools.glob_files } }, .rules = .{ .rules = &rules } };
+    defer probe.worker.deinit(alloc);
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    hooks.workspace_root = root;
+    hooks.tool_registry = probe.registry;
+    hooks.execute_delegate = .{ .ctx = &probe, .run = Probe.execute };
+    hooks.permission_request_override = .{ .context = &probe, .request_fn = Probe.permission };
+    var gateway = FakeGateway.init(alloc, &.{
+        .{ .tool_calls = &.{
+            .{ .id = "allowed", .name = "skill", .arguments_json = allowed_args },
+            .{ .id = "glob", .name = "glob_files", .arguments_json = "{\"pattern\":\"**/*.md\"}" },
+            .{ .id = "denied", .name = "skill", .arguments_json = denied_args },
+            .{ .id = "invalid", .name = "skill", .arguments_json = "{\"location\":\"skill:invalid\"}" },
+        } },
+        .{ .content = "final" },
+    });
+    defer gateway.deinit();
+    var deps = hooks.deps();
+    deps.prepare_skill_call = Probe.prepare;
+    deps.agent_stream_provider = gateway.provider();
+    var fixture: PromptFixture = .{ .workspace_root = root };
+    var config = fixture.config();
+    config.skill_catalog = .{ .skills = &catalog };
+    var job = fixture.job();
+    job.permission_mode = .auto;
+    var agent: @import("../agent.zig").Agent = .{};
+    defer agent.deinit(alloc);
+    try runtime_orchestrator.processAgentPrompt(&agent, &deps, null, testLifecycleContext(lifecycle_hooks.RuntimeView.empty(), alloc, root), config, job);
+    try std.testing.expectEqual(@as(usize, 3), probe.admission_count);
+    try std.testing.expectEqual(@as(usize, 2), hooks.executed_names.items.len);
+    try std.testing.expectEqual(@as(usize, 2), probe.started.load(.seq_cst));
+    try expectBodyContains(&gateway, 1, "PARALLEL_ALLOWED_REFERENCE");
+    try expectBodyContains(&gateway, 1, "InvalidSkillLocation");
+    try expectBodyContains(&gateway, 1, "tool_permission_denied");
+    try expectBodyNotContains(&gateway, 1, "DENIED_BODY_MUST_NOT_LOAD");
+    try expectBodyNotContains(&gateway, 1, "resolved_skill");
+}
+
+test "skill preparation failures publish discovery notices in sequential and parallel paths" {
+    const alloc = std.testing.allocator;
+    const contracts = @import("../../../skills/skill_contract.zig");
+    const Preparation = struct {
+        fn prepare(_: *anyopaque, arena: std.mem.Allocator, _: ToolCall, _: ?*const contracts.Locations) anyerror!contracts.CallPreparation {
+            return @import("../../../skills/skill_invocation.zig").prepareIdentity(arena, .{
+                .skills = &.{},
+                .diagnostics = &.{.{
+                    .path = "/skills/malformed",
+                    .source = .global_fx,
+                    .scope = .candidate,
+                    .cause = .{ .invalid_metadata = .missing_name },
+                }},
+            }, "missing", null, 4096);
+        }
+    };
+    const calls = [_]ToolCall{
+        .{ .id = "first", .name = "skill", .arguments_json = "{\"name\":\"missing\"}" },
+        .{ .id = "second", .name = "skill", .arguments_json = "{\"name\":\"missing\"}" },
+    };
+    for ([_]usize{ 1, 2 }) |count| {
+        var hooks = FakeAgentRuntimeDeps.init(alloc);
+        defer hooks.deinit();
+        hooks.tool_registry = .{ .tools = &.{builtin_tools.skill} };
+        var gateway = FakeGateway.init(alloc, &.{ .{ .tool_calls = calls[0..count] }, .{ .content = "final" } });
+        defer gateway.deinit();
+        var deps = hooks.deps();
+        deps.prepare_skill_call = Preparation.prepare;
+        deps.agent_stream_provider = gateway.provider();
+        var fixture = PromptFixture{};
+        var job = fixture.job();
+        job.permission_mode = .auto;
+        var agent: @import("../agent.zig").Agent = .{};
+        defer agent.deinit(alloc);
+        try runtime_orchestrator.processAgentPrompt(&agent, &deps, null, testLifecycleContext(lifecycle_hooks.RuntimeView.empty(), alloc, fixture.workspace_root), fixture.config(), job);
+        try std.testing.expectEqual(count, hooks.context_notices.items.len);
+        for (hooks.context_notices.items) |notice| {
+            try std.testing.expect(std.mem.find(u8, notice, "metadata is invalid (missing_name)") != null);
+        }
+        try std.testing.expectEqual(@as(usize, 0), hooks.permission_names.items.len);
+        try std.testing.expectEqual(@as(usize, 0), hooks.executed_names.items.len);
+        try expectBodyContains(&gateway, 1, "skill_discovery_warning");
+        try expectBodyContains(&gateway, 1, "not found");
+        try expectBodyNotContains(&gateway, 1, "metadata is invalid (missing_name)");
+    }
+}
+
+fn checkSkillPreparationCancellation(count: usize) !void {
+    const alloc = std.testing.allocator;
+    const contracts = @import("../../../skills/skill_contract.zig");
+    const Trigger = struct {
+        fn prepare(raw: *anyopaque, _: std.mem.Allocator, _: ToolCall, _: ?*const contracts.Locations) anyerror!contracts.CallPreparation {
+            const hooks: *FakeAgentRuntimeDeps = @ptrCast(@alignCast(raw));
+            hooks.cancel_on_execute.?.store(true, .seq_cst);
+            return error.Cancelled;
+        }
+    };
+    const calls = [_]ToolCall{
+        .{ .id = "first_skill", .name = "skill", .arguments_json = "{\"name\":\"workflow\"}" },
+        .{ .id = "second_skill", .name = "skill", .arguments_json = "{\"name\":\"workflow\"}" },
+    };
+    var fixture = PromptFixture{};
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    hooks.tool_registry = .{ .tools = &.{ builtin_tools.skill, builtin_tools.read_file } };
+    hooks.cancel_on_execute = &fixture.cancel_flag;
+    hooks.cancel_on_execute_name = "not-an-executed-tool";
+    hooks.exec_plans = &.{.{ .result = .{ .model_output = "prior completed output" } }};
+    var gateway = FakeGateway.init(alloc, &.{
+        .{ .tool_calls = &.{.{ .id = "prior", .name = "read_file", .arguments_json = "{\"path\":\"README.md\"}" }} },
+        .{ .tool_calls = calls[0..count] },
+    });
+    defer gateway.deinit();
+    var deps = hooks.deps();
+    deps.prepare_skill_call = Trigger.prepare;
+    deps.agent_stream_provider = gateway.provider();
+    var job = fixture.job();
+    job.permission_mode = .auto;
+    var agent: @import("../agent.zig").Agent = .{};
+    defer agent.deinit(alloc);
+    try runtime_orchestrator.processAgentPrompt(&agent, &deps, null, testLifecycleContext(lifecycle_hooks.RuntimeView.empty(), alloc, fixture.workspace_root), fixture.config(), job);
+    try std.testing.expectEqual(types.TurnPresentationOutcome.interrupted, hooks.finalized_outcome.?);
+    try std.testing.expectEqual(@as(usize, 1), hooks.finalization_count);
+    try std.testing.expectEqual(@as(usize, 1), hooks.executed_names.items.len);
+    try std.testing.expectEqual(@as(usize, 1), hooks.history_turns.items.len);
+    const interrupted = hooks.history_turns.items[0].interrupted;
+    try std.testing.expectEqual(@as(usize, 1), interrupted.execution.tool_steps.len);
+    try std.testing.expectEqualStrings("prior", interrupted.execution.tool_steps[0].tool_calls[0].id);
+    try std.testing.expectEqualStrings("prior completed output", interrupted.execution.tool_steps[0].tool_results[0].output);
+    for (calls[0..count]) |call| try expectSingleTerminalOutcome(hooks.lifecycle_events.items, call.id, .cancelled);
+}
+
+test "sequential skill preparation cancellation preserves interrupted history" {
+    try checkSkillPreparationCancellation(1);
+}
+
+test "parallel skill preparation cancellation preserves interrupted history" {
+    try checkSkillPreparationCancellation(2);
+}
+
+test "explicit skill preload cancellation finalizes as interrupted before model dispatch" {
+    const alloc = std.testing.allocator;
+    const Trigger = struct {
+        fn notice(raw: *anyopaque, _: []const u8) !void {
+            const hooks: *FakeAgentRuntimeDeps = @ptrCast(@alignCast(raw));
+            hooks.cancel_on_execute.?.store(true, .seq_cst);
+        }
+    };
+    var fixture = PromptFixture{};
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    hooks.cancel_on_execute = &fixture.cancel_flag;
+    var gateway = FakeGateway.init(alloc, &.{});
+    defer gateway.deinit();
+    var deps = hooks.deps();
+    deps.push_context_notice = Trigger.notice;
+    deps.agent_stream_provider = gateway.provider();
+    var config = fixture.config();
+    config.skill_catalog = .{
+        .skills = &.{.{ .name = "workflow", .description = "", .path = "/skills/workflow", .source = .global_fx }},
+        .diagnostics = &.{.{ .path = "/skills/malformed", .source = .global_fx, .scope = .candidate, .cause = .{ .invalid_metadata = .missing_name } }},
+    };
+    var job = fixture.job();
+    job.prompt = @constCast("$workflow");
+    var agent: @import("../agent.zig").Agent = .{};
+    defer agent.deinit(alloc);
+    try runtime_orchestrator.processAgentPrompt(&agent, &deps, null, testLifecycleContext(lifecycle_hooks.RuntimeView.empty(), alloc, fixture.workspace_root), config, job);
+    try std.testing.expectEqual(types.TurnPresentationOutcome.interrupted, hooks.finalized_outcome.?);
+    try std.testing.expectEqual(@as(usize, 1), hooks.finalization_count);
+    try std.testing.expectEqual(@as(usize, 1), hooks.history_turns.items.len);
+    try std.testing.expect(hooks.history_turns.items[0] == .interrupted);
+    try std.testing.expectEqual(@as(usize, 0), gateway.index);
+    try std.testing.expectEqual(@as(usize, 0), hooks.executed_names.items.len);
+}
+
 test "tool execution result propagates inner search usage exactly once" {
     const alloc = std.testing.allocator;
     const calls = [_]ToolCall{toolCall("call_search", "web_search", "{\"query\":\"current news\"}")};
@@ -1452,8 +1742,7 @@ test "selected dynamic MCP allow returned after cancellation never executes" {
     hooks.exec_plans = &.{
         .{ .result = .{
             .model_output = "selected",
-            .selected_dynamic_tool_name = "mcp_fixture_echo",
-            .selected_dynamic_tool_schema_json = "{\"type\":\"function\",\"name\":\"mcp_fixture_echo\",\"description\":\"Echo\",\"inputSchema\":{\"type\":\"object\",\"properties\":{}}}",
+            .selected_dynamic_tools = &.{.{ .name = "mcp_fixture_echo", .schema_json = "{\"type\":\"function\",\"name\":\"mcp_fixture_echo\",\"description\":\"Echo\",\"inputSchema\":{\"type\":\"object\",\"properties\":{}}}" }},
         } },
         .{ .result = .{ .model_output = "must not execute" } },
     };
@@ -1495,8 +1784,7 @@ test "selected dynamic MCP execution carries its validation generation" {
     hooks.exec_plans = &.{
         .{ .result = .{
             .model_output = "selected",
-            .selected_dynamic_tool_name = "mcp_fixture_echo",
-            .selected_dynamic_tool_schema_json = "{\"type\":\"function\",\"name\":\"mcp_fixture_echo\",\"description\":\"Echo\",\"inputSchema\":{\"type\":\"object\",\"properties\":{}}}",
+            .selected_dynamic_tools = &.{.{ .name = "mcp_fixture_echo", .schema_json = "{\"type\":\"function\",\"name\":\"mcp_fixture_echo\",\"description\":\"Echo\",\"inputSchema\":{\"type\":\"object\",\"properties\":{}}}" }},
         } },
         .{ .result = .{ .model_output = "called" } },
     };
@@ -1720,6 +2008,22 @@ fn expectRejectedPrompt(completion: FakeCompletion, expected_error: anyerror) !v
     try std.testing.expectEqual(@as(usize, 1), hooks.finalization_count);
     try std.testing.expectEqual(types.TurnPresentationOutcome.failed, hooks.finalized_outcome.?);
     try std.testing.expect(logContains(&hooks, "event:turn_finished"));
+}
+
+test "processQueuedPrompt rejects unstorable tool batches before permissions or execution" {
+    const oversized = [_]u8{'i'} ** 257;
+    const invalid = [_]ToolCall{
+        .{ .id = "bad", .name = "", .arguments_json = "{}" },
+        .{ .id = &oversized, .name = "read_file", .arguments_json = "{}" },
+        .{ .id = "bad", .name = "read_file", .provisional_id = &oversized, .arguments_json = "{}" },
+    };
+    const valid = toolCall("good", "write_file", "{\"path\":\"a.txt\",\"content\":\"x\"}");
+    for (invalid) |bad| {
+        for ([_]bool{ false, true }) |bad_first| {
+            const calls = if (bad_first) [_]ToolCall{ bad, valid } else [_]ToolCall{ valid, bad };
+            try expectRejectedPrompt(.{ .tool_calls = &calls }, error.MalformedAuthoritativeToolIdentity);
+        }
+    }
 }
 
 fn lifecycleCallId(event: types.ToolLifecycleEvent) ?[]const u8 {
@@ -2133,6 +2437,7 @@ test "provider search finalizes when stop includes provider result and final ans
     }};
     const completions = [_]FakeCompletion{.{
         .content = "Final [source](https://example.test/source)",
+        .provider_state_json = "[{\"type\":\"reasoning\",\"text\":\"private\"},{\"type\":\"tool-call\",\"toolCallId\":\"provider_search\",\"providerOptions\":{\"test\":{\"signature\":\"call\"}}},{\"type\":\"text\",\"offset\":0,\"length\":" ++ std.fmt.comptimePrint("{d}", .{"Final [source](https://example.test/source)".len}) ++ ",\"providerOptions\":{\"test\":{\"signature\":\"text\"}}}]",
         .tool_calls = &calls,
         .finish_reason = .stop,
     }};
@@ -2172,6 +2477,10 @@ test "provider search finalizes when stop includes provider result and final ans
     try std.testing.expect(step.assistant == null);
     try std.testing.expectEqual(@as(usize, 1), step.tool_results.len);
     try std.testing.expectEqualStrings(provider_result, step.tool_results[0].output);
+    try std.testing.expect(std.mem.find(u8, step.provider_replay.?.parts_json, "private") != null);
+    try std.testing.expect(std.mem.find(u8, step.provider_replay.?.parts_json, "\"signature\":\"text\"") == null);
+    try std.testing.expect(std.mem.find(u8, turn.provider_replay.?.parts_json, "\"signature\":\"text\"") != null);
+    try std.testing.expect(std.mem.find(u8, turn.provider_replay.?.parts_json, "private") == null);
 }
 
 test "interactive authoritative identity reconciles changed provisional id" {
@@ -2881,7 +3190,7 @@ test "modern context delta defers effectful call exactly once" {
     const terminal = hooks.lifecycle_events.items[2].terminal;
     try std.testing.expectEqual(types.ToolOutcomeKind.deferred, terminal.outcome.kind);
     try std.testing.expectEqualStrings(
-        "Not run — project instructions changed: write_file",
+        "Reading project instructions before continuing: write_file",
         terminal.outcome.summary,
     );
 }
@@ -3735,6 +4044,10 @@ test "bounded provider-executed results preserve raw typed status" {
 
 test "committed file result is appended before degraded secondary publication" {
     const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const result_dir = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(result_dir);
     const preview_lines = [_]diff.PreviewLine{.{
         .op = .addition,
         .new_line = 1,
@@ -3786,8 +4099,10 @@ test "committed file result is appended before degraded secondary publication" {
     };
     hooks.fail_status_finished = true;
     var fixture = PromptFixture{};
+    var config = fixture.config();
+    config.tool_result_dir = result_dir;
 
-    try runFakePrompt(&gateway, &hooks, fixture.config(), fixture.job());
+    try runFakePrompt(&gateway, &hooks, config, fixture.job());
 
     try std.testing.expect(hooks.last_file_request_allocators_distinct);
     const execute_index = logIndex(&hooks, "execute:write_file") orelse
@@ -3809,6 +4124,9 @@ test "committed file result is appended before degraded secondary publication" {
         "\"role\":\"user\"",
         "Summarize the committed change.",
     });
+    const persisted = hooks.history_turns.items[0].assistant.execution
+        .tool_steps[0].tool_results[0];
+    try std.testing.expect(persisted.output_handle != null);
 }
 
 test "terminal publication failure deletes retained command replay" {
@@ -5809,6 +6127,34 @@ test "processQueuedPrompt emits context notice for a continuing tool" {
     try std.testing.expectEqual(@as(usize, 2), deps.context_notices.items.len);
     try std.testing.expectEqualStrings("first context notice", deps.context_notices.items[0]);
     try std.testing.expectEqualStrings("second context notice", deps.context_notices.items[1]);
+}
+
+test "processQueuedPrompt projects a continuing tool notice as conversation" {
+    const alloc = std.testing.allocator;
+    const calls = [_]ToolCall{toolCall("call_1", "read_file", "{\"path\":\"a\"}")};
+    const completions = [_]FakeCompletion{
+        .{ .tool_calls = &calls },
+        .{ .content = "done" },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var deps = FakeAgentRuntimeDeps.init(alloc);
+    deps.exec_plans = &.{.{ .result = .{
+        .model_output = "tool output",
+        .system_notice = "continue with degraded visual evidence",
+    } }};
+    defer deps.deinit();
+    var fixture = PromptFixture{};
+
+    try runFakePrompt(&gateway, &deps, fixture.config(), fixture.job());
+
+    try std.testing.expectEqual(@as(usize, 2), gateway.request_bodies.items.len);
+    try expectBodyContainsInOrder(&gateway, 1, &.{
+        "\"toolName\":\"read_file\"",
+        "\"value\":\"tool output\"",
+        "\"role\":\"user\"",
+        "continue with degraded visual evidence",
+    });
 }
 
 test "parallel result assembly emits context notices in call order" {

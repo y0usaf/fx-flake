@@ -22,6 +22,15 @@ pub fn migrate(
     capability: *session_child_store.SessionChildCapability,
     provider: process_provider.Provider,
 ) !Result {
+    var record_probe = try capability.iterate(alloc, .background_records);
+    defer record_probe.deinit();
+    var log_probe = try capability.iterate(alloc, .background_logs);
+    defer log_probe.deinit();
+    const has_records = for (record_probe.names) |name| {
+        if (!std.mem.eql(u8, name, migration_lock_name)) break true;
+    } else false;
+    if (!has_records and log_probe.names.len == 0) return .{};
+
     var lock = try capability.acquireTimedAdvisoryLock(
         .background_records,
         migration_lock_name,

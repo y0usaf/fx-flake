@@ -603,9 +603,7 @@ fn buildTrustedPermissionFeedback(
 }
 
 fn encodeText(alloc: Allocator, raw: []const u8) ![]u8 {
-    const masked = try text_utils.maskSecrets(alloc, raw);
-    defer if (masked.ptr != raw.ptr) alloc.free(masked);
-    const encoded = try text_utils.encodeTerminalSafe(alloc, masked, std.math.maxInt(usize));
+    const encoded = try text_utils.encodeTerminalSafe(alloc, raw, std.math.maxInt(usize));
     return encoded.bytes;
 }
 

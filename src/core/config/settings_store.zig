@@ -1852,11 +1852,7 @@ fn validateKnownSettingsObject(
         }
     }
     if (object.get("permission_mode")) |value| {
-        if (value != .string or
-            (!std.ascii.eqlIgnoreCase(value.string, "ask") and
-                !std.ascii.eqlIgnoreCase(value.string, "auto") and
-                !std.ascii.eqlIgnoreCase(value.string, "yolo")))
-        {
+        if (value != .string or types.PermissionMode.parse(value.string) == null) {
             return error.InvalidSettingsFormat;
         }
     }
@@ -2073,6 +2069,29 @@ fn writeStoreFixture(dir: std.Io.Dir, sub_path: []const u8, text: []const u8) !v
     var file = try dir.createFile(io_mod.getIo(), sub_path, .{ .truncate = true });
     defer file.close(io_mod.getIo());
     try file.writeStreamingAll(io_mod.getIo(), text);
+}
+
+test "user patch accepts existing full access aliases and preserves their spelling" {
+    const alloc = std.testing.allocator;
+    for ([_][]const u8{ "full-access", "Full Access", "yolo" }) |mode| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+        const original = try std.fmt.allocPrint(alloc, "{{\"permission_mode\":\"{s}\"}}\n", .{mode});
+        defer alloc.free(original);
+        try writeStoreFixture(tmp.dir, "home/.fx/settings.json", original);
+        const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
+        defer alloc.free(home);
+        var store = try Store.initFromHome(alloc, home, .writable);
+        defer store.deinit(alloc);
+        var outcome = try store.applyUserPatch(alloc, .{ .yolo_acknowledged = true });
+        defer outcome.deinit(alloc);
+        try std.testing.expect(outcome == .committed);
+        const bytes = try store.readPrimaryForTest(alloc);
+        defer alloc.free(bytes);
+        try std.testing.expect(std.mem.find(u8, bytes, mode) != null);
+        try std.testing.expect(std.mem.find(u8, bytes, "\"yolo_acknowledged\":true") != null);
+    }
 }
 
 test "user patch writes user preferences at top level" {

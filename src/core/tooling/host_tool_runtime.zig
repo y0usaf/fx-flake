@@ -7,7 +7,7 @@ const Allocator = std.mem.Allocator;
 
 pub const max_tools: usize = 64;
 pub const max_name_bytes: usize = 64;
-pub const max_description_bytes: usize = 1024;
+pub const max_description_bytes: usize = 64 * 1024;
 pub const max_schema_bytes: usize = 64 * 1024;
 
 pub const ParseError = Allocator.Error || error{
@@ -201,6 +201,41 @@ test "host tool runtime validates and preserves raw schemas" {
     try std.testing.expect(runtime.toolSet().registry.lookup("lookup") != null);
     try std.testing.expectEqualStrings("lookup", runtime.dynamic_tools[0].name);
     try std.testing.expect(runtime.dynamic_tools[0].input_schema.object.get("properties") != null);
+}
+
+test "host tool runtime preserves long MCP descriptions" {
+    const alloc = std.testing.allocator;
+    const description = "Tool parameter guidance. " ** 100;
+    const parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        alloc,
+        "[{\"name\":\"lookup\",\"description\":\"" ++ description ++ "\",\"inputSchema\":{}}]",
+        .{},
+    );
+    defer parsed.deinit();
+    var runtime = try Runtime.init(alloc, parsed.value);
+    defer runtime.deinit();
+    try std.testing.expectEqualStrings(description, runtime.dynamic_tools[0].description);
+}
+
+test "host tool runtime bounds descriptions at 64 KiB" {
+    const alloc = std.testing.allocator;
+    const description = try alloc.alloc(u8, 64 * 1024 + 1);
+    defer alloc.free(description);
+    @memset(description, 'a');
+    for ([_]usize{ 64 * 1024, 64 * 1024 + 1 }) |length| {
+        const json = try std.fmt.allocPrint(alloc, "[{{\"name\":\"lookup\",\"description\":\"{s}\",\"inputSchema\":{{}}}}]", .{description[0..length]});
+        defer alloc.free(json);
+        const parsed = try std.json.parseFromSlice(std.json.Value, alloc, json, .{});
+        defer parsed.deinit();
+        if (length == 64 * 1024) {
+            var runtime = try Runtime.init(alloc, parsed.value);
+            defer runtime.deinit();
+            try std.testing.expectEqualStrings(description[0..length], runtime.dynamic_tools[0].description);
+        } else {
+            try std.testing.expectError(error.HostToolDescriptionTooLarge, Runtime.init(alloc, parsed.value));
+        }
+    }
 }
 
 test "host tool runtime rejects duplicate and invalid names" {

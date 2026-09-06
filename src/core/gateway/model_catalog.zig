@@ -1,5 +1,6 @@
 const std = @import("std");
 const credentials = @import("../auth/credentials.zig");
+const model_provider = @import("../config/model_provider.zig");
 const collections = @import("../shared/collections.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const io_mod = @import("../shared/io.zig");
@@ -138,6 +139,8 @@ pub const Provider = struct {
     /// When set, context must remain valid until every in-flight `fetch` returns.
     context: ?*anyopaque = null,
     fetch_fn: FetchFn,
+    provider_id: model_provider.ProviderId = .gateway,
+    refresh_interval_ms: ?i64 = null,
 
     /// Returns owned catalog entries; the caller frees them with `freeModelCatalog`.
     pub fn fetch(self: Provider, alloc: Allocator, input: FetchInput) Allocator.Error!ProviderResult {

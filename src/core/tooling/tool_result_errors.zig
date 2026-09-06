@@ -84,6 +84,16 @@ pub fn inspectTerminalActionFieldCorrection(
         .string => |value| value,
         else => return null,
     };
+    if (std.mem.eql(u8, code, "invalid_shell_request")) {
+        const executed = error_value.get("executed") orelse return null;
+        if (executed != .bool or executed.bool) return null;
+        const problems = error_value.get("problems") orelse return null;
+        if (problems != .array or problems.array.items.len == 0) return null;
+        for (problems.array.items) |problem| {
+            if (problem != .string) return null;
+        }
+        return .{ .invalid_field_count = problems.array.items.len };
+    }
     if (!std.mem.eql(u8, code, terminal_action_field_error_code)) return null;
     const action = error_value.get("action") orelse return null;
     if (action != .string) return null;
@@ -206,7 +216,7 @@ fn permissionDeniedSuggestion(
         .user_denied => "The tool did not run. Do not retry unchanged; explain the denial or use a safer allowed alternative.",
         .auto_denied => "The tool did not run. This is a legacy automatic denial; choose a materially different safe action or explain the blocker.",
         .review_caution => "The action did not run. Use the review advice to choose a materially different safe action, or explain why no safe path remains.",
-        .review_evidence_incomplete => "The action did not run because safety review could not inspect the complete exact action. Do not retry unchanged; remove literal secret material, use a symbolic reference, or choose a materially different action.",
+        .review_evidence_incomplete => "The action did not run because safety review could not inspect the complete exact action. Do not retry unchanged; reduce the action or supporting evidence to fit the review limits, or choose a materially different fully inspectable action.",
         .review_unavailable => "The action did not run because safety review was unavailable. Continue with a different safe action or retry later.",
         .policy_denied => "The tool did not run. Do not retry unchanged; explain the configured policy blocker or use an allowed alternative.",
         .permission_required => "The tool did not run. Noninteractive mode cannot show an approval prompt. Rerun interactively to approve, or configure a narrow permission rule before retrying.",
@@ -352,6 +362,14 @@ pub fn malformedToolArgumentsJson(alloc: Allocator, tool_name: []const u8) Alloc
         .tool_name = tool_name,
         .message = "Tool arguments were not valid JSON.",
         .suggestion = "Reissue the tool call with complete valid JSON arguments matching the tool schema.",
+    });
+}
+
+pub fn nonObjectToolArgumentsJson(alloc: Allocator, tool_name: []const u8) Allocator.Error![]u8 {
+    return toolExecutionFailureJson(alloc, .{
+        .tool_name = tool_name,
+        .message = "Tool arguments must be a JSON object. The call was not executed.",
+        .suggestion = "Reissue the tool call with a JSON object matching the tool schema.",
     });
 }
 

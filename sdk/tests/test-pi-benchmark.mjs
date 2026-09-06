@@ -2,6 +2,7 @@
 import { strict as assert } from "node:assert";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
+import { benchmarkInstructionsBytes } from "../../benchmarks/libfx/workload.mjs";
 
 const piRoot = process.env.LIBFX_BENCH_PI_ROOT;
 if (!piRoot) {
@@ -25,5 +26,12 @@ assert.equal(report.samples[0].text, "hello");
 assert.ok(report.samples[0].spawn_to_first_stdout_ms >= 0);
 assert.ok(report.samples[0].prompt_to_fetch_ms >= 0);
 assert.ok(report.samples[0].first_body_to_first_text_ms >= 0);
+assert.equal(report.samples[0].non_prompt_fetches, 0);
+assert.ok(report.samples[0].request_bytes > 0);
+assert.ok(report.samples[0].system_context_bytes >= benchmarkInstructionsBytes);
+assert.equal(
+  report.samples[0].system_context_overhead_bytes,
+  report.samples[0].system_context_bytes - benchmarkInstructionsBytes,
+);
 
 console.log("pi benchmark integration passed");

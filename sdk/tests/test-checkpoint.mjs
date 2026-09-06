@@ -10,7 +10,7 @@ const sourceBackend = process.argv[2] || "native";
 const targetBackend = process.argv[3] || "wasm";
 const scriptDir = fileURLToPath(new URL(".", import.meta.url));
 const addon = resolve(scriptDir, "../../zig-out/lib/libfx.node");
-const wasm = await readFile(resolve(scriptDir, "../../zig-out/bin/fx-core.wasm"));
+const wasm = await readFile(resolve(scriptDir, "../../zig-out/bin/omfx-core.wasm"));
 let modelRequests = 0;
 
 const server = createServer((request, response) => {

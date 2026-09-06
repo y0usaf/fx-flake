@@ -344,6 +344,41 @@ async function runTerminalToolScenario(args: {
 
 describe("filesystem path handling", () => {
   test(
+    "ast_symbols parses declarations from an external source file",
+    async () => {
+      const root = createIsolatedRoot();
+      const target = join(root.external, "wallet.ts");
+      writeFileSync(target, "export class Wallet {\n  deposit() {}\n}\n");
+      const gateway = startFakeGateway([
+        toolCall("ast_symbols_1", "ast_symbols", { path: target }),
+        finalText("ast symbols complete"),
+      ]);
+      try {
+        const result = await runFx(
+          ["ask", "--auto", "--json", "--no-save", "Parse the requested source file once."],
+          {
+            cwd: root.workspace,
+            env: gatewayEnv(root, gateway, root.home),
+            timeoutMs: TIMEOUT,
+          },
+        );
+        const json = parseFxJson(result);
+        expect(gateway.requests).toHaveLength(2);
+        expect(toolResultOutput(gateway.requests[1]!.body, "ast_symbols_1")).toContain(
+          "class Wallet",
+        );
+        expect(json.tool_calls).toEqual([
+          { name: "ast_symbols", status: "success" },
+        ]);
+      } finally {
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
     "empty optional search paths use the workspace root",
     async () => {
       const root = createIsolatedRoot();

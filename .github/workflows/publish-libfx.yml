@@ -192,8 +192,8 @@ jobs:
         with:
           name: libfx-wasm
           path: |
-            zig-out/bin/fx-core.wasm
-            zig-out/bin/fx-term.wasm
+            zig-out/bin/omfx-core.wasm
+            zig-out/bin/omfx-term.wasm
           if-no-files-found: error
 
   publish:
@@ -234,8 +234,8 @@ jobs:
       - name: Restore package artifact layout
         run: |
           mkdir -p zig-out/bin
-          cp wasm-artifacts/fx-core.wasm zig-out/bin/fx-core.wasm
-          cp wasm-artifacts/fx-term.wasm zig-out/bin/fx-term.wasm
+          cp wasm-artifacts/fx-core.wasm zig-out/bin/omfx-core.wasm
+          cp wasm-artifacts/fx-term.wasm zig-out/bin/omfx-term.wasm
 
       - name: Stage package without executing repository code
         env:
@@ -261,7 +261,7 @@ jobs:
 
           rm -rf sdk/dist/libfx
           mkdir -p sdk/dist/libfx
-          cp sdk/package.json sdk/README.md sdk/browser.js sdk/node.js sdk/fx-sdk.js sdk/mcp.js sdk/skills.js sdk/skills-node.js LICENSE sdk/dist/libfx/
+          cp sdk/package.json sdk/README.md sdk/browser.js sdk/node.js sdk/fx-sdk.js sdk/core-output.js sdk/mcp.js sdk/skills.js sdk/skills-node.js LICENSE sdk/dist/libfx/
           cp wasm-artifacts/fx-core.wasm wasm-artifacts/fx-term.wasm sdk/dist/libfx/
           cp native-addons/*.node sdk/dist/libfx/
           jq --arg version "$LIBFX_VERSION" '.version = $version | del(.files)' \
@@ -282,7 +282,7 @@ jobs:
             const names = new Set(report.files.map(({ path }) => path));
             const required = [
               "package.json", "README.md", "LICENSE", "browser.js", "node.js", "fx-sdk.js",
-              "mcp.js", "skills.js", "skills-node.js",
+              "core-output.js", "mcp.js", "skills.js", "skills-node.js",
               "fx-core.wasm", "fx-term.wasm",
               "libfx.linux-x64.node", "libfx.linux-arm64.node",
               "libfx.darwin-x64.node", "libfx.darwin-arm64.node",

@@ -400,6 +400,28 @@ pub fn activeToolActivityCount(shell: anytype) usize {
     return shell.activeToolActivityCount();
 }
 
+pub fn presentActiveToolCancellation(
+    alloc: Allocator,
+    shell: anytype,
+) !bool {
+    const Shell = @TypeOf(shell.*);
+    if (comptime !@hasDecl(Shell, "presentActiveToolCancellation")) {
+        return false;
+    }
+    return shell.presentActiveToolCancellation(alloc);
+}
+
+pub fn writeTurnCancellation(
+    alloc: Allocator,
+    shell: anytype,
+    metrics: *Metrics,
+    record: bool,
+) !void {
+    const Shell = @TypeOf(shell.*);
+    if (comptime !@hasDecl(Shell, "writeTurnCancellation")) return;
+    try shell.writeTurnCancellation(alloc, metrics, record);
+}
+
 pub fn requestRedraw(
     shell: *TranscriptRuntime,
     metrics: *Metrics,

@@ -2,7 +2,6 @@ const std = @import("std");
 const stream_provider = @import("../agent/stream_provider.zig");
 const model_provider = @import("../config/model_provider.zig");
 const model_capabilities = @import("../config/model_capabilities.zig");
-const types = @import("../shared/types.zig");
 const provider_catalog = @import("../auth/provider_catalog.zig");
 const generation_usage_provider = @import("../session/generation_usage_provider.zig");
 const gateway_provider = @import("gateway_provider.zig");
@@ -24,7 +23,6 @@ pub const Bundle = struct {
     };
 
     capabilities: Capabilities = .{},
-    compaction_model: ?[]const u8 = null,
     presentation: ?*const provider_catalog.Entry = null,
     auth_strategy: ?AuthStrategy = null,
     fallback_model_capabilities_fn: *const fn ([]const u8) model_capabilities.Capabilities = emptyModelCapabilities,
@@ -45,16 +43,6 @@ pub const Bundle = struct {
     }
 };
 
-pub const CompactionRouteDecision = union(enum) {
-    ready: model_provider.ProviderSelection,
-    unavailable: UnavailableReason,
-
-    pub const UnavailableReason = enum {
-        missing_policy,
-        unauthorized_credential,
-    };
-};
-
 fn emptyModelCapabilities(_: []const u8) model_capabilities.Capabilities {
     return .{};
 }
@@ -70,19 +58,6 @@ pub const Set = struct {
             .codex => self.codex,
             .grok => self.grok,
         };
-    }
-
-    pub fn compactionRoute(
-        self: Set,
-        provider: model_provider.ProviderId,
-        credential_source: ?types.CredentialSource,
-    ) CompactionRouteDecision {
-        const model = self.select(provider).compaction_model orelse
-            return .{ .unavailable = .missing_policy };
-        if (!model_provider.authorizesCredential(provider, credential_source)) {
-            return .{ .unavailable = .unauthorized_credential };
-        }
-        return .{ .ready = .{ .provider = provider, .model = model } };
     }
 
     pub fn deferredUsageProviders(self: Set) generation_usage_provider.Set {
@@ -187,37 +162,4 @@ test "provider set selects each provider's complete route" {
     providers.codex.model_catalog = null;
     try std.testing.expect(providers.select(.codex).model_catalog == null);
     try std.testing.expect(providers.select(.gateway).model_catalog != null);
-}
-
-test "provider compaction route preserves provider and credential authority" {
-    const routes = Set{
-        .gateway = .{ .compaction_model = "openai/gpt-5.6-luna" },
-        .codex = .{ .compaction_model = "gpt-5.6-luna" },
-        .grok = .{ .compaction_model = "grok-4.5" },
-    };
-    const cases = [_]struct {
-        provider: model_provider.ProviderId,
-        source: types.CredentialSource,
-        model: []const u8,
-    }{
-        .{ .provider = .gateway, .source = .ai_gateway_api_key, .model = "openai/gpt-5.6-luna" },
-        .{ .provider = .codex, .source = .chatgpt_subscription, .model = "gpt-5.6-luna" },
-        .{ .provider = .grok, .source = .grok_subscription, .model = "grok-4.5" },
-    };
-    for (cases) |case| {
-        const route = routes.compactionRoute(case.provider, case.source);
-        try std.testing.expectEqual(case.provider, route.ready.provider);
-        try std.testing.expectEqualStrings(case.model, route.ready.model);
-    }
-
-    try std.testing.expectEqual(
-        CompactionRouteDecision.UnavailableReason.unauthorized_credential,
-        routes.compactionRoute(.codex, .ai_gateway_api_key).unavailable,
-    );
-    var missing = routes;
-    missing.grok.compaction_model = null;
-    try std.testing.expectEqual(
-        CompactionRouteDecision.UnavailableReason.missing_policy,
-        missing.compactionRoute(.grok, .grok_subscription).unavailable,
-    );
 }

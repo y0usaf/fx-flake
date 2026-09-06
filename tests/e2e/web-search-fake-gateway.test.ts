@@ -880,7 +880,7 @@ describe("web_search Gateway fixture", () => {
           const request = JSON.parse(gateway.requests[0].body);
           expect(request).not.toHaveProperty("reasoning");
           expect(request).not.toHaveProperty("fast");
-          expect(request.providerOptions?.gateway).toBeUndefined();
+          expect(request.providerOptions?.gateway).toEqual({ caching: "auto" });
           expect(gateway.requests[0].body).not.toContain('"thinking"');
 
           const stored = JSON.parse(

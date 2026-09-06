@@ -49,6 +49,7 @@ test "Codex reviewer model remains catalog-selected gpt-5.6-luna" {
 }
 
 test "Codex reviewer builds a direct Responses request with gpt-5.6-luna" {
+    const instructions = [_]types.ChatMessage{.{ .role = .system, .content = "Review the pending action." }};
     const messages = [_]types.ChatMessage{
         .{ .role = .user, .content = "User requested the change." },
         .{
@@ -59,12 +60,12 @@ test "Codex reviewer builds a direct Responses request with gpt-5.6-luna" {
                 .arguments_json = "{\"path\":\"a.txt\"}",
             }},
         },
-        .{ .role = .system, .content = "Review the pending action." },
     };
     var cancelled = std.atomic.Value(bool).init(false);
     const body = try responses_reviewer.buildPayloadForTest(
         std.testing.allocator,
         openai_codex_models.reviewer_model,
+        &instructions,
         &messages,
         "call_review",
         std.Io.Clock.Timestamp.fromNow(@import("../core/shared/io.zig").getIo(), .{

@@ -1,19 +1,24 @@
 import { access, readFile } from "node:fs/promises";
+import { closeSync } from "node:fs";
 import { createRequire } from "node:module";
+import { Socket } from "node:net";
 import { homedir } from "node:os";
 import { isAbsolute, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import { CoreOutput } from "./core-output.js";
 import {
   createFxAgent as createWasmAgent,
   createFxTerminal as createWasmTerminal,
   encodeXtermKeyEvent,
   fxSdkApiVersion,
+  listModels,
   supportsJspi,
   xtermAdapter,
 } from "./fx-sdk.js";
 
-export { encodeXtermKeyEvent, fxSdkApiVersion, supportsJspi, xtermAdapter };
+export { encodeXtermKeyEvent, fxSdkApiVersion, listModels, supportsJspi, xtermAdapter };
 export const libfxApiVersion = 2;
+const nativeCoreApiVersion = 3;
 
 const fetchOperationStale = 0;
 const fetchOperationApplied = 1;
@@ -62,10 +67,10 @@ async function loadNativeCandidate(candidate) {
 function validateNativeBackend(backend) {
   if (!backend) return null;
   const hasLowLevelCore = typeof backend.createCore === "function";
-  if ((hasLowLevelCore && backend.libfxApiVersion !== libfxApiVersion) ||
-    (!hasLowLevelCore && backend.libfxApiVersion !== undefined && backend.libfxApiVersion !== libfxApiVersion)) {
+  const expectedVersion = hasLowLevelCore ? nativeCoreApiVersion : libfxApiVersion;
+  if ((hasLowLevelCore || backend.libfxApiVersion !== undefined) && backend.libfxApiVersion !== expectedVersion) {
     const actualVersion = backend.libfxApiVersion ?? "missing";
-    throw new Error(`native addon API version ${actualVersion} is incompatible with libfx API version ${libfxApiVersion}`);
+    throw new Error(`native addon API version ${actualVersion} is incompatible with expected API version ${expectedVersion}`);
   }
   if (typeof backend.createCore !== "function" && typeof backend.createFxTerminal !== "function") {
     throw new Error("native addon must export createCore() or createFxTerminal()");
@@ -128,9 +133,24 @@ function createNativeCoreRuntime(addon, options) {
     ...(model === undefined ? {} : { model }),
     ...(gatewayChatUrl === undefined ? {} : { gatewayChatUrl }),
   });
+  let readyFd;
+  let readySocket;
+  try {
+    readyFd = addon.takeCoreReadyFd(core);
+    readySocket = new Socket({ fd: readyFd, readable: true, writable: false });
+  } catch (error) {
+    if (readyFd !== undefined) {
+      try { closeSync(readyFd); } catch {}
+    }
+    addon.destroyCore(core);
+    throw error;
+  }
+  const readyClosed = new Promise((resolve) => readySocket.once("close", resolve));
   let exitedResolve;
   let lineHandler = null;
-  let lineBuffer = "";
+  const output = new CoreOutput((message, size) => lineHandler(message, size));
+  let draining = false;
+  let outputError;
   let settled = false;
   let fetchState = null;
   const exited = new Promise((resolve) => { exitedResolve = resolve; });
@@ -138,13 +158,15 @@ function createNativeCoreRuntime(addon, options) {
     fetchState?.controller.abort();
     try { addon.abortCoreFetch(core); } catch {}
   };
-  const finish = (code) => {
+  const finish = (code, error) => {
     if (settled) return;
     settled = true;
-    clearInterval(timer);
+    outputError = error;
+    output.close();
     abortHostEffects();
     try { addon.destroyCore(core); } catch {}
-    exitedResolve(code);
+    readySocket.destroy();
+    void readyClosed.then(() => exitedResolve(code));
   };
   const pumpFetch = async (request) => {
     const controller = new AbortController();
@@ -188,10 +210,14 @@ function createNativeCoreRuntime(addon, options) {
         } catch {}
       }
     } finally {
-      if (fetchState === state) fetchState = null;
+      if (fetchState === state) {
+        fetchState = null;
+        queueMicrotask(drainReady);
+      }
     }
   };
-  const timer = setInterval(() => {
+  function drainReady() {
+    if (settled) return;
     try {
       if (fetchState) {
         if (!fetchState.controller.signal.aborted && !addon.coreFetchActive(core, fetchState.handle)) {
@@ -201,29 +227,55 @@ function createNativeCoreRuntime(addon, options) {
         const fetchRequest = addon.takeCoreFetch(core);
         if (fetchRequest) void pumpFetch(JSON.parse(fetchRequest.toString("utf8")));
       }
-      const chunk = addon.drainCore(core);
-      if (chunk.length && lineHandler) {
-        lineBuffer += chunk.toString("utf8");
-        for (;;) {
-          const newline = lineBuffer.indexOf("\n");
-          if (newline < 0) break;
-          const line = lineBuffer.slice(0, newline);
-          lineBuffer = lineBuffer.slice(newline + 1);
-          if (line) void Promise.resolve(lineHandler(JSON.parse(line))).catch(() => finish(1));
-        }
+      if (addon.coreExitCode(core) !== 0) {
+        finish(1, new Error("native output delivery failed"));
+        return;
       }
-      if (addon.coreExited(core)) finish(addon.coreExitCode(core));
-    } catch {
-      finish(1);
+      void drainOutput();
+    } catch (error) {
+      finish(1, error);
     }
-  }, 2);
+  }
+  async function drainOutput() {
+    if (draining || settled) return;
+    draining = true;
+    try {
+      while (!settled) {
+        const chunk = addon.drainCore(core);
+        if (!chunk.length) break;
+        const pending = output.write(chunk);
+        if (pending) await pending;
+      }
+      if (!settled && addon.coreExited(core)) {
+        output.finish();
+        finish(addon.coreExitCode(core));
+      }
+    } catch (error) {
+      finish(1, error);
+    } finally {
+      draining = false;
+    }
+  }
+
+  readySocket.on("data", drainReady);
+  readySocket.on("end", () => { drainReady(); if (!settled) finish(1); });
+  readySocket.on("error", () => finish(1));
+  readySocket.on("close", () => { if (!settled) finish(1); });
+  // Some runtimes defer descriptor adoption until connect().
+  if (readySocket.pending) {
+    try { readySocket.connect({ fd: readyFd }); } catch (error) { finish(1); throw error; }
+  }
 
   return {
     exited,
+    get error() { return outputError; },
     write(data) { addon.writeCore(core, Buffer.from(data)); },
     closeStdin() { addon.closeCore(core); },
     abortHostEffects,
-    abort() { abortHostEffects(); addon.closeCore(core); },
+    abort(error) {
+      if (error) finish(1, error);
+      else { abortHostEffects(); addon.closeCore(core); }
+    },
     setLineHandler(handler) { lineHandler = handler; },
   };
 }

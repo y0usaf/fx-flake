@@ -52,7 +52,7 @@ pub fn build(b: *std.Build) void {
     build_options.addOption(WasmSurface, "wasm_surface", .none);
 
     const exe = b.addExecutable(.{
-        .name = "fx",
+        .name = "omfx",
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/main.zig"),
             .target = target,
@@ -67,10 +67,6 @@ pub fn build(b: *std.Build) void {
         }),
     });
     exe.root_module.addImport("build_options", build_options.createModule());
-    const genome_mod = addGenomeModule(b, "native", target, optimize);
-    exe.root_module.addImport("genome", genome_mod);
-    const rush_mod = addRushModule(b, target, optimize);
-    exe.root_module.addImport("rush_app", rush_mod);
 
     b.installArtifact(exe);
 
@@ -80,17 +76,24 @@ pub fn build(b: *std.Build) void {
         run_cmd.addArgs(args);
     }
 
-    const run_step = b.step("run", "Run fx");
+    const genome_mod = addGenomeModule(b, "native", target, optimize);
+    exe.root_module.addImport("genome", genome_mod);
+    const rush_mod = addRushModule(b, target, optimize);
+    exe.root_module.addImport("rush_app", rush_mod);
+
+    const run_step = b.step("run", "Run omfx");
     run_step.dependOn(&run_cmd.step);
 
+    const test_filters = b.option([]const []const u8, "test-filter", "Only run unit tests matching these names") orelse &.{};
     const exe_tests = b.addTest(.{
         .root_module = exe.root_module,
+        .filters = test_filters,
     });
     const run_exe_tests = b.addRunArtifact(exe_tests);
     run_exe_tests.step.dependOn(b.getInstallStep());
     run_exe_tests.setEnvironmentVariable(
         "FX_TEST_PRODUCT_EXE",
-        b.getInstallPath(.bin, "fx"),
+        b.getInstallPath(.bin, "omfx"),
     );
 
     const test_step = b.step("test", "Run tests");
@@ -103,6 +106,35 @@ pub fn build(b: *std.Build) void {
         addNapiArtifact(b, napi_surface, target, git_commit, app_version, update_channel);
     }
 
+    const mcp_test_exports = b.createModule(.{
+        .root_source_file = b.path("src/mcp_test_exports.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    mcp_test_exports.addImport("build_options", build_options.createModule());
+    const mcp_dispatcher_e2e = b.addExecutable(.{
+        .name = "mcp-stdio-dispatcher-driver",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path(
+                "tests/e2e/fixtures/mcp-stdio-dispatcher-driver.zig",
+            ),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+    mcp_dispatcher_e2e.root_module.addImport(
+        "mcp_test_exports",
+        mcp_test_exports,
+    );
+    const run_mcp_dispatcher_e2e = b.addRunArtifact(mcp_dispatcher_e2e);
+    if (b.args) |args| run_mcp_dispatcher_e2e.addArgs(args);
+    const mcp_dispatcher_e2e_step = b.step(
+        "run-mcp-stdio-dispatcher-e2e",
+        "Run the MCP stdio dispatcher E2E driver",
+    );
+    mcp_dispatcher_e2e_step.dependOn(&run_mcp_dispatcher_e2e.step);
 
     // --- file_index search benchmark ---
     const benchmark_exports_mod = b.createModule(.{
@@ -160,6 +192,24 @@ pub fn build(b: *std.Build) void {
     );
     run_ui_activity_bench_step.dependOn(&run_ui_activity_bench.step);
 
+    const ui_activity_bench_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("benchmarks/activity_progress.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    ui_activity_bench_tests.root_module.addImport(
+        "benchmark_exports",
+        benchmark_exports_mod,
+    );
+    const run_ui_activity_bench_tests = b.addRunArtifact(ui_activity_bench_tests);
+    test_step.dependOn(&run_ui_activity_bench_tests.step);
+    const test_ui_activity_bench_step = b.step(
+        "test-ui-activity-benchmark",
+        "Run UI activity benchmark policy tests",
+    );
+    test_ui_activity_bench_step.dependOn(&run_ui_activity_bench_tests.step);
 
     // --- file-diff approval review benchmark ---
     const approval_review_bench = b.addExecutable(.{
@@ -194,6 +244,27 @@ pub fn build(b: *std.Build) void {
     );
     run_approval_review_bench_step.dependOn(&run_approval_review_bench.step);
 
+    const approval_review_bench_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("benchmarks/approval_review.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    approval_review_bench_tests.root_module.addImport(
+        "benchmark_exports",
+        benchmark_exports_mod,
+    );
+    const run_approval_review_bench_tests = b.addRunArtifact(
+        approval_review_bench_tests,
+    );
+    const test_approval_review_bench_step = b.step(
+        "test-approval-review-benchmark",
+        "Run file-diff approval review benchmark qualification tests",
+    );
+    test_approval_review_bench_step.dependOn(
+        &run_approval_review_bench_tests.step,
+    );
 
     const pgso_ir_step = b.step(
         "pgso-ir",
@@ -224,6 +295,7 @@ pub fn build(b: *std.Build) void {
         pgso_ir_step.dependOn(&missing_artifact.step);
     }
 }
+
 fn addRushModule(
     b: *std.Build,
     target: std.Build.ResolvedTarget,
@@ -329,8 +401,8 @@ fn addWasmArtifact(
         .none => unreachable,
     };
     const description = switch (surface) {
-        .core => "Build the headless fx WebAssembly artifact",
-        .term => "Build the terminal fx WebAssembly artifact",
+        .core => "Build the headless omfx WebAssembly artifact",
+        .term => "Build the terminal omfx WebAssembly artifact",
         .none => unreachable,
     };
 
@@ -361,6 +433,7 @@ fn addWasmArtifact(
             .strip = true,
         }),
     });
+    if (surface == .core) wasm_exe.stack_size = 1024 * 1024;
     wasm_exe.root_module.addImport("build_options", wasm_options.createModule());
 
     const install_wasm = b.addInstallArtifact(wasm_exe, .{});

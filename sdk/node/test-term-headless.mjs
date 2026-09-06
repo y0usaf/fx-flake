@@ -8,7 +8,7 @@ import { createFxTerminal, supportsJspi, xtermAdapter } from "../node.js";
 const { Terminal } = xtermHeadless;
 
 const scriptDir = fileURLToPath(new URL(".", import.meta.url));
-const defaultWasm = resolve(scriptDir, "../../zig-out/bin/fx-term.wasm");
+const defaultWasm = resolve(scriptDir, "../../zig-out/bin/omfx-term.wasm");
 const wasmPath = resolve(process.argv[2] || defaultWasm);
 
 if (!supportsJspi()) {
@@ -31,11 +31,11 @@ const mockFetch = async (_url, init) => {
   return new Response(new ReadableStream({
     async start(controller) {
       firstChunkAt = performance.now();
-      controller.enqueue(encoded.encode('data: {"type":"text-delta","delta":"streamed"}\n'));
+      controller.enqueue(encoded.encode('data: {"type":"text-delta","delta":"streamed"}\n\n'));
       await new Promise((resolve) => setTimeout(resolve, 20));
-      controller.enqueue(encoded.encode('data: {"type":"text-delta","delta":" response"}\n'));
-      controller.enqueue(encoded.encode('data: {"type":"finish","finishReason":{"unified":"stop"},"usage":{"inputTokens":{"total":1},"outputTokens":{"total":2}}}\n'));
-      controller.enqueue(encoded.encode("data: [DONE]\n"));
+      controller.enqueue(encoded.encode('data: {"type":"text-delta","delta":" response"}\n\n'));
+      controller.enqueue(encoded.encode('data: {"type":"finish","finishReason":{"unified":"stop"},"usage":{"inputTokens":{"total":1},"outputTokens":{"total":2}}}\n\n'));
+      controller.enqueue(encoded.encode("data: [DONE]\n\n"));
       controller.close();
     },
   }), { status: 200, headers: { "content-type": "text/event-stream" } });

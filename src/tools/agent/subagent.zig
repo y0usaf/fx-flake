@@ -268,6 +268,7 @@ test "call executes a validated managed request through the provider" {
             }, input);
             defer result.deinit(alloc);
             switch (result) {
+                .rich => return error.TestUnexpectedRichResult,
                 .success => |body| try std.testing.expectEqualStrings("{\"ok\":true}", body),
                 .failure => return error.TestUnexpectedResult,
             }
@@ -312,6 +313,7 @@ test "call reports compact host unavailability" {
             const result = try call(.{ .allocator = alloc }, input);
             defer result.deinit(alloc);
             switch (result) {
+                .rich => return error.TestUnexpectedRichResult,
                 .success => return error.TestUnexpectedResult,
                 .failure => |body| try std.testing.expect(std.mem.find(
                     u8,

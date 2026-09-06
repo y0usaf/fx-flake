@@ -1,6 +1,8 @@
 #!/usr/bin/env node
 import { strict as assert } from "node:assert";
+import { closeSync } from "node:fs";
 import { mkdtemp, writeFile } from "node:fs/promises";
+import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -9,6 +11,7 @@ import {
   createFxTerminal,
   fxSdkApiVersion,
   libfxApiVersion,
+  listModels,
 } from "../node.js";
 import * as browser from "../browser.js";
 
@@ -17,12 +20,15 @@ assert.equal(fxSdkApiVersion, 2);
 assert.equal(browser.libfxApiVersion, 2);
 assert.equal(typeof browser.createFxAgent, "function");
 assert.equal(typeof browser.createFxTerminal, "function");
+assert.equal(typeof browser.listModels, "function");
+assert.equal(typeof listModels, "function");
 
 const scriptDir = fileURLToPath(new URL(".", import.meta.url));
 const realNativeAddon = resolve(scriptDir, "../../zig-out/lib/libfx.node");
 const dir = await mkdtemp(resolve(tmpdir(), "libfx-loader-"));
 const nativePath = resolve(dir, "native.mjs");
 await writeFile(nativePath, `
+  export const libfxApiVersion = 2;
   export async function createFxTerminal(options) { return { backend: "native-terminal", options }; }
 `);
 const nativeUrl = pathToFileURL(nativePath);
@@ -31,6 +37,37 @@ const highLevelAgentPath = resolve(dir, "high-level-agent.mjs");
 await writeFile(highLevelAgentPath, `
   export const libfxApiVersion = 2;
   export function createFxAgent() { throw new Error("high-level createFxAgent invoked"); }
+`);
+
+// Complete the fixture directory before a runtime caches its module-resolution entries.
+const coreOnlyPath = resolve(dir, "core-only.mjs");
+await writeFile(coreOnlyPath, `
+  export const libfxApiVersion = 3;
+  export function createCore() { throw new Error("unused createCore"); }
+`);
+const incompatiblePath = resolve(dir, "incompatible.mjs");
+await writeFile(incompatiblePath, `
+  export const libfxApiVersion = 4;
+  export async function createFxAgent() {}
+`);
+const versionFixtures = [
+  ["missing-version", `
+    export function createCore() { throw new Error("missing-version createCore invoked"); }
+  `],
+  ["unequal-version", `
+    export const libfxApiVersion = 4;
+    export function createCore() { throw new Error("unequal-version createCore invoked"); }
+  `],
+];
+for (const [name, source] of versionFixtures) await writeFile(resolve(dir, `${name}.mjs`), source);
+const matchingVersionPath = resolve(dir, "matching-version.mjs");
+await writeFile(matchingVersionPath, `
+  export const libfxApiVersion = 3;
+  export function createCore() {
+    const error = new Error("matching-version createCore invoked");
+    error.code = "MATCHING_VERSION_INVOKED";
+    throw error;
+  }
 `);
 await assert.rejects(
   createFxAgent({
@@ -119,39 +156,20 @@ try {
   Object.defineProperty(WebAssembly, "promising", { configurable: true, value: savedPromising });
 }
 
-const coreOnlyPath = resolve(dir, "core-only.mjs");
-await writeFile(coreOnlyPath, `
-  export const libfxApiVersion = 2;
-  export function createCore() { throw new Error("unused createCore"); }
-`);
 await assert.rejects(
   createFxTerminal({ nativeAddon: pathToFileURL(coreOnlyPath), backend: "native" }),
   (error) => error?.code === "LIBFX_NATIVE_UNAVAILABLE" &&
     error.message.includes("createFxTerminal"),
 );
 
-const incompatiblePath = resolve(dir, "incompatible.mjs");
-await writeFile(incompatiblePath, `
-  export const libfxApiVersion = 3;
-  export async function createFxAgent() {}
-`);
 await assert.rejects(
   createFxAgent({ nativeAddon: pathToFileURL(incompatiblePath), backend: "native", apiKey: "loader-key" }),
   (error) => error?.code === "LIBFX_NATIVE_UNAVAILABLE" &&
     error.message.includes("incompatible"),
 );
 
-for (const [name, source] of [
-  ["missing-version", `
-    export function createCore() { throw new Error("missing-version createCore invoked"); }
-  `],
-  ["unequal-version", `
-    export const libfxApiVersion = 3;
-    export function createCore() { throw new Error("unequal-version createCore invoked"); }
-  `],
-]) {
+for (const [name] of versionFixtures) {
   const modulePath = resolve(dir, `${name}.mjs`);
-  await writeFile(modulePath, source);
   await assert.rejects(
     createFxAgent({ nativeAddon: pathToFileURL(modulePath), backend: "native", apiKey: "loader-key" }),
     (error) => error?.code === "LIBFX_NATIVE_UNAVAILABLE" &&
@@ -161,19 +179,33 @@ for (const [name, source] of [
   );
 }
 
-const matchingVersionPath = resolve(dir, "matching-version.mjs");
-await writeFile(matchingVersionPath, `
-  export const libfxApiVersion = 2;
-  export function createCore() {
-    const error = new Error("matching-version createCore invoked");
-    error.code = "MATCHING_VERSION_INVOKED";
-    throw error;
-  }
-`);
 await assert.rejects(
   createFxAgent({ nativeAddon: pathToFileURL(matchingVersionPath), backend: "native", apiKey: "loader-key" }),
   (error) => error?.code === "MATCHING_VERSION_INVOKED",
-  "matching v2 low-level addon must reach createCore",
+  "matching v3 low-level addon must reach createCore",
 );
 
-console.log("libfx loader passed: browser exports, native preference, fallback diagnostics, semantic errors, and strict low-level API validation");
+const addon = createRequire(import.meta.url)(realNativeAddon);
+let failedCore;
+let failedCoreDestroyed = false;
+const brokenReaderAddon = {
+  ...addon,
+  createCore(options) { return failedCore = addon.createCore(options); },
+  takeCoreReadyFd(core) {
+    const fd = addon.takeCoreReadyFd(core);
+    closeSync(fd);
+    return fd;
+  },
+  destroyCore(core) {
+    failedCoreDestroyed = true;
+    return addon.destroyCore(core);
+  },
+};
+try {
+  await assert.rejects(createFxAgent({ backend: "native", nativeAddon: brokenReaderAddon, apiKey: "loader-key" }));
+  assert.ok(failedCoreDestroyed, "failed readiness adoption must still destroy the native runtime");
+} finally {
+  if (failedCore) addon.destroyCore(failedCore);
+}
+
+console.log("libfx loader passed: browser exports, native preference, fallback diagnostics, semantic errors, strict low-level API validation, and failed-start cleanup");

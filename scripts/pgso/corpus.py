@@ -390,7 +390,7 @@ def _installed_training_binary(
 ) -> Iterator[pathlib.Path]:
     if not binary.is_file() or binary.stat().st_size == 0:
         raise PgsoError(f"training binary is missing or empty: {binary}")
-    canonical = corpus.repo_root / "zig-out" / "bin" / "fx"
+    canonical = corpus.repo_root / "zig-out" / "bin" / "omfx"
     canonical.parent.mkdir(parents=True, exist_ok=True)
     if canonical.is_symlink():
         raise PgsoError(f"canonical training binary cannot be a symlink: {canonical}")

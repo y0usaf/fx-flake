@@ -7,6 +7,8 @@ const io_mod = @import("../core/shared/io.zig");
 const secret = @import("../core/auth/secret.zig");
 const types = @import("../core/shared/types.zig");
 const gateway_client = @import("client.zig");
+const versions = @import("../core/gateway/provider_versions.zig");
+const version_lookup = @import("provider_versions.zig");
 
 const max_catalog_models: usize = 128;
 const max_model_id_bytes: usize = 1024;
@@ -15,11 +17,12 @@ const fetch_timeout_ms: i64 = 30_000;
 const default_models_endpoint = "https://chatgpt.com/backend-api/codex/models";
 const e2e_models_endpoint_env = "FX_E2E_OPENAI_CODEX_MODELS_URL";
 
-pub const protocol_client_version = "0.148.0";
 pub const reviewer_model = "gpt-5.6-luna";
 
 pub const model_catalog_provider = model_catalog.Provider{
     .fetch_fn = fetchCatalogForProvider,
+    .provider_id = .codex,
+    .refresh_interval_ms = versions.refresh_interval_ms,
 };
 
 pub const cli_model_catalog_provider = gateway_provider.CliModelCatalogProvider{
@@ -70,14 +73,28 @@ fn fetchCatalogForProvider(
         };
         break :account owned_account_id.?;
     } else null;
-    const request_url = modelsUrl(alloc) catch |err| {
+    var fallback_cancel = std.atomic.Value(bool).init(false);
+    const cancel_flag = input.cancel_flag orelse &fallback_cancel;
+    const deadline = std.Io.Clock.Timestamp.fromNow(io_mod.getIo(), .{
+        .clock = .awake,
+        .raw = .fromMilliseconds(fetch_timeout_ms),
+    });
+    const version = if (request_auth.credential != null)
+        version_lookup.resolve(alloc, .codex, cancel_flag, deadline) catch |err| {
+            if (err == error.OutOfMemory) return error.OutOfMemory;
+            return .{ .failure = .{
+                .category = if (err == error.Cancelled) .cancellation else .transport,
+                .retryable = err != error.Cancelled,
+            } };
+        }
+    else
+        null;
+    const request_url = modelsUrl(alloc, version) catch |err| {
         if (err == error.OutOfMemory) return error.OutOfMemory;
         return .{ .failure = .{ .category = .runtime } };
     };
     defer alloc.free(request_url);
 
-    var fallback_cancel = std.atomic.Value(bool).init(false);
-    const cancel_flag = input.cancel_flag orelse &fallback_cancel;
     var operation = FetchOperation{
         .alloc = alloc,
         .url = request_url,
@@ -88,10 +105,7 @@ fn fetchCatalogForProvider(
         FetchResponse,
         alloc,
         cancel_flag,
-        std.Io.Clock.Timestamp.fromNow(io_mod.getIo(), .{
-            .clock = .awake,
-            .raw = .fromMilliseconds(fetch_timeout_ms),
-        }),
+        deadline,
         &operation,
     ) catch |err| {
         if (err == error.OutOfMemory) return error.OutOfMemory;
@@ -203,16 +217,17 @@ const FetchOperation = struct {
     }
 };
 
-fn modelsUrl(alloc: std.mem.Allocator) ![]u8 {
+fn modelsUrl(alloc: std.mem.Allocator, version: ?versions.Version) ![]u8 {
     const base = io_mod.getenv(e2e_models_endpoint_env) orelse default_models_endpoint;
     if (io_mod.getenv(e2e_models_endpoint_env) != null and !gateway_client.isLoopbackHttpUrl(base)) {
         return error.InvalidE2ECodexModelsEndpoint;
     }
+    const compatible = version orelse return alloc.dupe(u8, base);
     const separator: u8 = if (std.mem.findScalar(u8, base, '?') == null) '?' else '&';
     return std.fmt.allocPrint(
         alloc,
         "{s}{c}client_version={s}",
-        .{ base, separator, protocol_client_version },
+        .{ base, separator, compatible.slice() },
     );
 }
 
@@ -349,11 +364,11 @@ test "Codex catalog parser keeps visible API models and live capabilities" {
     try std.testing.expectEqual(@as(u32, 272_000), model.context_window);
 }
 
-test "Codex catalog URL uses the live-validated protocol compatibility version" {
-    const url = try modelsUrl(std.testing.allocator);
+test "Codex catalog URL uses the resolved compatibility version" {
+    const url = try modelsUrl(std.testing.allocator, versions.Version.parse("0.999.1").?);
     defer std.testing.allocator.free(url);
-    try std.testing.expect(std.mem.find(u8, url, "client_version=0.148.0") != null);
-    try std.testing.expect(std.mem.find(u8, url, "client_version=0.0.4") == null);
+    try std.testing.expect(std.mem.find(u8, url, "client_version=0.999.1") != null);
+    try std.testing.expect(std.mem.find(u8, url, "client_version=0.148.0") == null);
 }
 
 test "host-managed Codex catalog auth carries no local headers" {

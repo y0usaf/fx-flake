@@ -9,7 +9,7 @@ import { createFxAgent } from "../node.js";
 const backend = process.argv[2] || "native";
 const scriptDir = fileURLToPath(new URL(".", import.meta.url));
 const addon = resolve(scriptDir, "../../zig-out/lib/libfx.node");
-const wasmPath = resolve(scriptDir, "../../zig-out/bin/fx-core.wasm");
+const wasmPath = resolve(scriptDir, "../../zig-out/bin/omfx-core.wasm");
 const encoded = new TextEncoder();
 let modelRequests = 0;
 let toolCalls = 0;
