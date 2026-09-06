@@ -3,6 +3,8 @@ from __future__ import annotations
 import dataclasses
 import os
 import pathlib
+import shutil
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -29,6 +31,7 @@ from scripts.pgso.pipeline import (
     instrumented_link_argv,
     link_candidate,
     merge_profile_batch,
+    normalize_genome_archive,
     parse_compiler_runtime,
     profile_use_argv,
     reject_profile_outputs,
@@ -66,11 +69,72 @@ class PgsoPipelineTests(unittest.TestCase):
 
     def test_bitcode_emission_requires_main_parser_archive(self) -> None:
         self.paths.bitcode.write_bytes(b"BC\xc0\xde")
-        with patch("scripts.pgso.pipeline.run_checked"):
+        with patch("scripts.pgso.pipeline.run_checked"), patch(
+            "scripts.pgso.pipeline.normalize_genome_archive"
+        ):
             with self.assertRaisesRegex(PgsoError, "Tree-sitter C archive"):
                 emit_bitcode(self.toolchain, self.spec, self.paths)
             (self.paths.ir_prefix / "pgso/genome.a").write_bytes(b"archive")
             self.assertEqual(sha256_file(self.paths.bitcode), emit_bitcode(self.toolchain, self.spec, self.paths))
+
+    def test_normalize_genome_archive_rebuilds_darwin_members(self) -> None:
+        llvm_ar_name = shutil.which("llvm-ar")
+        if llvm_ar_name is None:
+            self.skipTest("LLVM ar fixture is unavailable")
+        llvm_ar = pathlib.Path(llvm_ar_name)
+        archive = self.paths.ir_prefix / "pgso" / "genome.a"
+        object_file = self.root / "fixture.o"
+        object_file.write_bytes(b"fixture object!!")
+        subprocess.run(
+            (str(llvm_ar), "--format=gnu", "rcsD", str(archive), str(object_file)),
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        raw_archive = bytearray(archive.read_bytes())
+        self.assertEqual(b"644     ", raw_archive[48:56])
+        raw_archive[48:56] = b"0       "
+        archive.write_bytes(raw_archive)
+        toolchain = dataclasses.replace(self.toolchain, llvm_ar=llvm_ar)
+
+        normalize_genome_archive(toolchain, archive, self.paths)
+        original_bytes = object_file.read_bytes()
+        first_hash = sha256_file(archive)
+        normalize_genome_archive(toolchain, archive, self.paths)
+        self.assertEqual(first_hash, sha256_file(archive))
+
+        extraction = self.root / "verify"
+        extraction.mkdir()
+        subprocess.run(
+            (str(llvm_ar), "x", str(archive)),
+            cwd=extraction,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        extracted = extraction / "fixture.o"
+        self.assertEqual(0o644, extracted.stat().st_mode & 0o777)
+        self.assertEqual(original_bytes, extracted.read_bytes())
+        self.assertEqual(("fixture.o",), tuple(
+            line.strip() for line in subprocess.run(
+                (str(llvm_ar), "t", str(archive)),
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.splitlines()
+        ))
+
+    def test_normalize_genome_archive_rejects_unsafe_member_lists(self) -> None:
+        archive = self.paths.ir_prefix / "pgso" / "genome.a"
+        archive.write_bytes(b"archive")
+        for members in ("../escape.o\n", "one.o\none.o\n"):
+            with self.subTest(members=members), patch(
+                "scripts.pgso.pipeline.run_checked",
+                return_value=SimpleNamespace(stdout=members, stderr=""),
+            ) as run:
+                with self.assertRaisesRegex(PgsoError, "member"):
+                    normalize_genome_archive(self.toolchain, archive, self.paths)
+                run.assert_called_once()
 
     def test_open_reconstructs_an_existing_artifact_layout(self) -> None:
         marker = self.paths.bitcode

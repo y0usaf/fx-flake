@@ -4,6 +4,7 @@ import dataclasses
 import os
 import pathlib
 import re
+import tempfile
 import stat
 import uuid
 from collections.abc import Sequence
@@ -270,6 +271,79 @@ def genome_link_args(paths: PipelinePaths) -> tuple[str, ...]:
     return (str(paths.ir_prefix / "pgso" / "genome.a"),)
 
 
+def normalize_genome_archive(
+    toolchain: Toolchain,
+    archive: pathlib.Path,
+    paths: PipelinePaths,
+) -> None:
+    """Rewrite Zig's archive in Darwin format with usable member modes."""
+    if paths.selector != "omfx":
+        return
+
+    with tempfile.TemporaryDirectory(
+        prefix=".genome-archive-", dir=archive.parent
+    ) as temporary:
+        extraction = pathlib.Path(temporary)
+        listed = run_checked(
+            (str(toolchain.llvm_ar), "t", str(archive)),
+            cwd=extraction,
+            env=os.environ.copy(),
+            timeout_s=60,
+            log_path=paths.logs / "genome-archive-list.json",
+            require_empty_stderr=True,
+        )
+        members = tuple(
+            line.strip() for line in listed.stdout.splitlines() if line.strip()
+        )
+        if not members:
+            raise PgsoError(f"Tree-sitter C archive has no members: {archive}")
+        if any(
+            member != pathlib.Path(member).name
+            or pathlib.Path(member).suffix != ".o"
+            or member in (".", "..")
+            for member in members
+        ):
+            raise PgsoError(
+                f"Tree-sitter C archive has an unsafe member name: {archive}"
+            )
+        if len(set(members)) != len(members):
+            raise PgsoError(f"Tree-sitter C archive has duplicate members: {archive}")
+
+        run_checked(
+            (str(toolchain.llvm_ar), "x", str(archive)),
+            cwd=extraction,
+            env=os.environ.copy(),
+            timeout_s=60,
+            log_path=paths.logs / "genome-archive-extract.json",
+            require_empty_stderr=True,
+        )
+        for member in members:
+            extracted = extraction / member
+            if not extracted.is_file() or extracted.is_symlink():
+                raise PgsoError(
+                    f"Tree-sitter C archive member was not extracted safely: {member}"
+                )
+            extracted.chmod(0o644)
+
+        normalized = extraction / "genome-normalized.a"
+        run_checked(
+            (
+                str(toolchain.llvm_ar),
+                "--format=darwin",
+                "rcsD",
+                str(normalized),
+                *sorted(members),
+            ),
+            cwd=extraction,
+            env=os.environ.copy(),
+            timeout_s=60,
+            log_path=paths.logs / "genome-archive-repack.json",
+            require_empty_stderr=True,
+        )
+        _require_nonempty_file(normalized, "normalized Tree-sitter C archive")
+        os.replace(normalized, archive)
+
+
 def zig_build_argv(
     toolchain: Toolchain,
     spec: ArtifactSpec,
@@ -435,7 +509,9 @@ def emit_bitcode(
         log_path=paths.logs / "emit-bitcode.json",
     )
     for archive in genome_link_args(paths):
-        _require_nonempty_file(pathlib.Path(archive), "Tree-sitter C archive")
+        archive_path = pathlib.Path(archive)
+        _require_nonempty_file(archive_path, "Tree-sitter C archive")
+        normalize_genome_archive(toolchain, archive_path, paths)
     _require_nonempty_file(paths.bitcode, "ReleaseSafe LLVM bitcode")
     with paths.bitcode.open("rb") as stream:
         if stream.read(4) != b"BC\xc0\xde":
